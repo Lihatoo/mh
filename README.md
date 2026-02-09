@@ -158,10 +158,7 @@ sudo mh --help
 Use `profile_template/` as a sanitized example of the basic profile format.
 可参考 `profile_template/` 作为去隐私后的基础配置格式示例。
 
-## Privacy / 隐私
 
-Private folders are ignored and should not be uploaded: `history/`, `tnt/`.
-私有目录已忽略且不应上传：`history/`, `tnt/`.
 
 ## Files created / 生成文件
 
