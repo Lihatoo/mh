@@ -201,6 +201,8 @@ write_cfg() { # name url file
 
   cat >  "${MIHOMO_ROOT}/$name/config.yaml" <<YAML # 直接使用这个即可
 mixed-port: ${MIXED_PORT}
+socks-port: ${MIXED_PORT}
+
 allow-lan: false
 bind-address: ${API_HOST}
 mode: global
@@ -504,8 +506,8 @@ select_one(){ # select name
     return 1
    fi
   fi
-    start_end "start" "$name"
     echo "$name" > "${MIHOMO_ROOT}/current.profile"
+    start_end "start" "$name"
     wait_api 5 || warn "mihomo API not ready yet"
     speedtest_now 1000
 
