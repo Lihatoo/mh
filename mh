@@ -8,7 +8,7 @@ PID_FILE=${MIHOMO_ROOT}/run.pid # 固定pid文件
 API_HOST="127.0.0.1"
 API_PORT="9090"
 MIXED_PORT="7890" #  默认main
-
+SOCK_PORT="7891"
 API_BASE="http://${API_HOST}:${API_PORT}"
 API_SECRET="" # 这是密钥，用于验证；对应yaml中设置的secret字段，保持一致即可；如果不设置，默认空字符串，表示不验证
 
@@ -201,7 +201,7 @@ write_cfg() { # name url file
 
   cat >  "${MIHOMO_ROOT}/$name/config.yaml" <<YAML # 直接使用这个即可
 mixed-port: ${MIXED_PORT}
-socks-port: ${MIXED_PORT}
+socks-port: ${SOCK_PORT}
 
 allow-lan: false
 bind-address: ${API_HOST}
