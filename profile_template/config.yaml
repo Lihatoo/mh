@@ -1,0 +1,42 @@
+mixed-port: 7890
+allow-lan: false
+bind-address: 127.0.0.1
+mode: global
+log-level: info
+
+external-controller: 127.0.0.1:9090
+secret: ""
+
+proxy-providers:
+  example:
+    type: http
+    url: "https://example.com/your-subscription.yaml"
+    interval: 3600
+    path: ./providers/example.yaml
+
+proxy-groups:
+  - name: Proxy
+    type: select
+    use:
+      - example
+
+# Optional TUN + DNS (enabled via `mh tnu on`):
+# tun:
+#   enable: true
+#   stack: system
+#   device: mihomo
+#   auto-route: true
+#   auto-detect-interface: true
+#   dns-hijack:
+#     - any:53
+#
+# dns:
+#   enable: true
+#   listen: 127.0.0.1:1053
+#   enhanced-mode: fake-ip
+#   nameserver:
+#     - 223.5.5.5
+#     - 119.29.29.29
+#   fallback:
+#     - 1.1.1.1
+#     - 8.8.8.8

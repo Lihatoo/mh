@@ -1,0 +1,821 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s nullglob
+MIHOMO_ROOT=/home/lht/bfile/mihomo
+MIHOMO_BIN=${MIHOMO_ROOT}/mihomo # 指向二进制文件
+PID_FILE=${MIHOMO_ROOT}/run.pid # 固定pid文件
+
+API_HOST="127.0.0.1"
+API_PORT="9090"
+MIXED_PORT="7890" #  默认main
+
+API_BASE="http://${API_HOST}:${API_PORT}"
+API_SECRET="" # 这是密钥，用于验证；对应yaml中设置的secret字段，保持一致即可；如果不设置，默认空字符串，表示不验证
+
+# 简单彩色（不喜欢颜色就把这些变量都设为空字符串）
+c_reset=$'\e[0m'
+c_title=$'\e[1;36m'
+c_key=$'\e[1;33m'
+c_ok=$'\e[1;32m'
+c_warn=$'\e[1;31m'
+c_dim=$'\e[2m'
+urlenc() {
+  python3 - <<'PY' "$1"
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=''))
+PY
+}
+
+
+
+#===============测试小工具，下======================================
+log() {
+    local level=$1
+    shift
+    echo "[$(date +%H:%M:%S)] [$level] $*"
+}
+debug() { [[ "${DEBUG:-0}" == "1" ]] && log "DEBUG" "$@"; }
+info()  { log "INFO" "$@"; }
+warn()  { log "WARN" "$@"; }
+error() { log "ERROR" "$@"; }
+die()   { error "$@"; exit 1; }
+ok()    { log "OK" "$@"; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+test_env() { # 测试一下环境
+    need ss
+    need yq
+    need jq
+    need curl
+    need find
+    [[ -x "$MIHOMO_BIN" ]] || die "mihomo not executable: $MIHOMO_BIN"
+    echo "环境正确 ; env is ok"
+}
+test_port() {
+  local port
+  for port in "$@"; do
+    if ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "(:|\\.)${port}\$"; then
+      die "port already in use: $port"
+    fi
+  done
+}
+api_get() {
+  if [[ -n "${API_SECRET}" ]]; then
+    curl -fsS -H "Authorization: Bearer ${API_SECRET}" "${API_BASE}$1"
+  else
+    curl -fsS "${API_BASE}$1"
+  fi
+}
+
+api_put() {
+  local path="$1"
+  local data="$2"
+  if [[ -n "${API_SECRET}" ]]; then
+    curl -fsS -X PUT -H "Authorization: Bearer ${API_SECRET}" -H 'Content-Type: application/json' \
+      -d "$data" "${API_BASE}${path}"
+  else
+    curl -fsS -X PUT -H 'Content-Type: application/json' -d "$data" "${API_BASE}${path}"
+  fi
+}
+
+api_delay() {
+  local name="$1"
+  local timeout="${2:-2000}"
+  local url="http://www.gstatic.com/generate_204"
+  local enc_name enc_url
+  enc_name="$(urlenc "$name")"
+  enc_url="$(urlenc "$url")"
+  local out
+  out="$(api_get "/proxies/${enc_name}/delay?timeout=${timeout}&url=${enc_url}" 2>/dev/null || true)"
+  jq -r 'if (.delay|type)=="number" then (.delay|tostring) else "-" end' <<<"$out" 2>/dev/null || echo "-"
+}
+switch_group_node() {
+  # 用法：switch_group_node "<group>" "<node>"
+  local group="$1"
+  local node="$2"
+  [[ -n "$group" && -n "$node" ]] || return 1
+
+  local enc_group
+  enc_group="$(urlenc "$group")"
+
+  api_put "/proxies/${enc_group}" "$(jq -nc --arg name "$node" '{name:$name}')" >/dev/null
+  info "Switched group [$group] -> [$node]"
+}
+#===============测试小工具，上======================================
+
+
+#==============================配置文件读取，下======================================
+get_main_group() {
+  local pjson
+  pjson="$(api_get "/proxies" 2>/dev/null)" || return 1
+
+  # 1) prefer group named "Proxy"
+  if jq -e '.proxies["Proxy"]? != null and .proxies["Proxy"].all? != null' >/dev/null <<<"$pjson"; then
+    echo "Proxy"
+    return 0
+  fi
+
+  # 2) fallback to your heuristic
+  jq -r '
+    .proxies
+    | to_entries
+    | map(select(.value.all? != null))
+    | (map(select(.value.type?=="Selector" or .value.type?=="URLTest" or .value.type?=="Fallback" or .value.type?=="LoadBalance")) + .)
+    | .[0].key // empty
+  ' <<<"$pjson"
+}
+
+get_now_node() {
+  # 输出“当前节点名”；失败输出空并返回非 0
+  local group pjson
+  group="$(get_main_group)" || return 1
+  [[ -n "$group" ]] || return 1
+
+  pjson="$(api_get "/proxies" 2>/dev/null)" || return 1
+  jq -r --arg g "$group" '.proxies[$g].now // empty' <<<"$pjson"
+}
+
+
+#==============================配置文件读取，上======================================
+
+#============================测速、测速结果处理，下=================================
+
+speedtest_node_delay() {
+  # 用 mihomo 内置 delay API 测某个节点，输出 ms 或 "-"
+  # 用法：speedtest_node_delay "<node_name>" [timeout_ms]
+  local node="${1:-}"
+  local timeout_ms="${2:-1000}"
+  [[ -n "$node" ]] || { echo "-"; return 1; }
+
+  # DIRECT/REJECT 没必要测
+  if [[ "$node" == "DIRECT" || "$node" == "REJECT" ]]; then
+    echo "-"
+    return 0
+  fi
+  api_delay "$node" "$timeout_ms"
+}
+speedtest_now() {
+  # 用法：speedtest_now [timeout_ms]
+  local timeout_ms="${1:-1000}"
+  local node delay
+  node="$(get_now_node || true)"
+  if [[ -z "$node" ]]; then
+    echo "⚠️  无法获取当前节点（mihomo API 不通或没有可用 group）"
+    return 1
+  fi
+
+  delay="$(speedtest_node_delay "$node" "$timeout_ms")"
+  # 简单打个标
+  local badge="🟡"
+  if [[ "$delay" =~ ^[0-9]+$ ]]; then
+    if (( delay <= 150 )); then badge="🟢"
+    elif (( delay <= 400 )); then badge="🟡"
+    else badge="🔴"
+    fi
+  else
+    badge="⚪"
+  fi
+  echo "👉 当前节点：${node}"
+  echo "${badge} 延迟：${delay} ms  (timeout=${timeout_ms})"
+}
+wait_api() {
+  local t="${1:-5}"  # seconds
+  local i=0
+  while (( i < t*10 )); do
+    if api_get "/proxies" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i+1))
+  done
+  return 1
+}
+#============================测速、测速结果处理，上=================================
+
+#============================mihomo配置，下==================
+write_cfg() { # name url file 
+  local name="$1"
+  local url="$2"
+
+  cat >  "${MIHOMO_ROOT}/$name/config.yaml" <<YAML # 直接使用这个即可
+mixed-port: ${MIXED_PORT}
+allow-lan: false
+bind-address: ${API_HOST}
+mode: global
+log-level: info
+
+external-controller: ${API_HOST}:${API_PORT}
+secret: ""
+
+proxy-providers:
+  ${name}:
+    type: http
+    url: "${url}"
+    interval: 3600
+    path: "${MIHOMO_ROOT}/$name/providers/$name.yaml"
+
+proxy-groups:
+  - name: Proxy
+    type: select
+    use:
+      - ${name}
+YAML
+}
+
+#=====================mihomo配置，上====================================
+print_mihomo_status() {
+  local timeout_ms="${1:-2000}"
+
+  # 1) configs：运行态端口/LAN/mode
+  local cfg
+  if ! cfg="$(api_get "/configs")"; then
+    echo "${c_warn}✗ Cannot reach mihomo API at ${API_BASE}${c_reset}"
+    return 1
+  fi
+
+  local allow_lan bind_addr mode log_level mixed_port ec
+  allow_lan="$(jq -r '."allow-lan" // false' <<<"$cfg")"
+  bind_addr="$(jq -r '."bind-address" // "-"' <<<"$cfg")"
+  mode="$(jq -r '.mode // "-"' <<<"$cfg")"
+  log_level="$(jq -r '."log-level" // "-"' <<<"$cfg")"
+  mixed_port="$(jq -r '."mixed-port" // .port // "-"' <<<"$cfg")"
+  ec="$(jq -r '."external-controller" // "-"' <<<"$cfg")"
+
+  local lan_badge
+  if [[ "$allow_lan" == "true" ]]; then
+    lan_badge="${c_ok}ON${c_reset}"
+  else
+    lan_badge="${c_warn}OFF${c_reset}"
+  fi
+
+  # 2) proxies：找主组 + now + all（节点列表）
+  local pjson
+  pjson="$(api_get "/proxies")" || { echo "${c_warn}✗ Cannot read /proxies${c_reset}"; return 1; }
+
+  # 自动选“主组”：优先 Selector/URLTest/Fallback/LoadBalance，其次任意有 all 的
+  local group
+  group="$(jq -r '
+    .proxies
+    | to_entries
+    | map(select(.value.all? != null))
+    | (map(select(.value.type?=="Selector" or .value.type?=="URLTest" or .value.type?=="Fallback" or .value.type?=="LoadBalance")) + .)
+    | .[0].key // empty
+  ' <<<"$pjson")"
+
+  if [[ -z "$group" ]]; then
+    echo "${c_warn}✗ No proxy groups found in /proxies (unexpected)${c_reset}"
+    return 1
+  fi
+
+  local now node_count
+  now="$(jq -r --arg g "$group" '.proxies[$g].now // "-"' <<<"$pjson")"
+  node_count="$(jq -r --arg g "$group" '.proxies[$g].all | length' <<<"$pjson" 2>/dev/null || echo "-")"
+
+  # 3) 当前节点 delay（DIRECT/REJECT 不测）
+  local now_delay="-"
+  if [[ "$now" != "-" && "$now" != "DIRECT" && "$now" != "REJECT" ]]; then
+    now_delay="$(api_delay "$now" "$timeout_ms")"
+  fi
+
+  # 4) 好看输出
+  echo
+  echo "${c_title}╔══════════════════════════════ Mihomo Live Status ══════════════════════════════╗${c_reset}"
+  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "API" "${API_BASE}  ${c_dim}(external-controller=${ec})${c_reset}"
+  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "Ports" "mixed-port=${mixed_port}"
+  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "LAN" "allow-lan=${lan_badge}  bind=${bind_addr}"
+  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "Mode / Log" "mode=${mode}  log-level=${log_level}"
+  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "Main Group" "${group}"
+  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "Nodes" "count=${node_count}"
+  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "Now Using" "${now}  ${c_dim}(delay=${now_delay}ms)${c_reset}"
+  echo "${c_title}╚═══════════════════════════════════════════════════════════════════════════════╝${c_reset}"
+  echo
+}
+
+on_off() { # 启动/停止代理，
+    if [[ "$1" == "on" ]]; then
+        export HTTP_PROXY="http://${API_HOST}:${MIXED_PORT}"
+        export HTTPS_PROXY="http://${API_HOST}:${MIXED_PORT}"
+        info "Proxy ON: HTTP_PROXY and HTTPS_PROXY set to ${API_HOST}:${MIXED_PORT}"
+        speedtest_now 1000
+    elif [[ "$1" == "off" ]]; then
+        unset HTTP_PROXY HTTPS_PROXY
+        info "Proxy OFF: HTTP_PROXY and HTTPS_PROXY unset"
+    else
+        die "usage: $0 on|off"
+    fi
+}
+start_end(){  # start/end name/none 文件
+    local start0Rend=$1
+    local name_file=${2:-}
+    local cfg=$MIHOMO_ROOT/$name_file
+    if [[ "$start0Rend" == "start" ]]; then
+        start_end "end" # 先停止当前
+        if [[ -d $cfg ]];then
+            # 进入的前提配置没有问题，可以直接运行
+            info "start mihomo with config=$cfg/config.yaml data=$cfg"
+            # 前台跑不方便，这里后台启动并记录 pid
+            test_port "$API_PORT" "$MIXED_PORT"
+            "$MIHOMO_BIN" -d "$cfg" >"$cfg/mihomo.log" 2>&1 & # 每次启动情况记录
+            # on_off on
+            echo $! >"$PID_FILE" # 保存到定点位置
+        fi
+    elif [[ "$start0Rend" == "end" ]]; then
+        if [[ -f "$PID_FILE" ]]; then # 存在就终止
+            local pid
+            pid="$(cat "$PID_FILE" || true)"
+            if [[ -n "${pid}" ]] && kill "$pid" 2>/dev/null; then
+              info "stop process  pid=$pid"
+              kill "$pid" 2>/dev/null || true
+              # 等一下让它退出
+              for _ in {1..20}; do
+                  kill -0 "$pid" 2>/dev/null || break
+                  sleep 0.1
+              done
+              if kill -0 "$pid" 2>/dev/null; then
+                warn "force kill pid=$pid"
+                kill -9 "$pid" 2>/dev/null || true
+              fi
+            fi
+            rm -f "$PID_FILE"
+            # on_off off
+        fi
+    else
+        die "usage: $0 start|end"
+    fi
+}
+
+cfg_add() { # add name src
+  if [[ "$1" == "add" ]]; then
+    shift # 去掉 "add" 参数
+  fi
+  local name="$1"
+  local src="$2"
+  local cfg_root="${MIHOMO_ROOT}/${name}"
+  [[ -n "$name" ]] || die "usage: $0 add <name> <url|file>"
+  [[ -n "$src" ]]  || die "usage: $0 add <name> <url|file>"
+  if [[ -d "$cfg_root" ]]; then
+    die "profile exists: $cfg_root ,请换一个名称"
+  fi
+  mkdir -p "$cfg_root"
+  mkdir -p "$cfg_root/providers"  # 
+  write_cfg "$name" "$src" 
+  if [[ -f "$src" ]]; then #file: 直接复制,不用下载了
+    info "copy file -> ${cfg_root}/providers/$name.yaml"
+    cp -f "$src" "$cfg_root/providers/$name.yaml"
+    yq -y -i "
+      .[\"proxy-providers\"][\"$name\"].type = \"file\" |
+      del(.[\"proxy-providers\"][\"$name\"].url) |
+      del(.[\"proxy-providers\"][\"$name\"].interval)
+    " "$cfg_root/config.yaml"
+    info "saved: ${cfg_root}/providers/$name.yaml" # 有了文件，等会挂载
+  fi
+    # 启动这个配置
+    select_one "select" "$name" # 启动这个新的节点
+    print_mihomo_status 1000
+}
+
+get_group_nodes_json() {
+  local pjson group nodes
+  pjson="$(api_get "/proxies")" || return 1
+
+  group="$(get_main_group)" || return 1
+  [[ -n "$group" ]] || return 1
+
+  nodes="$(jq -c --arg g "$group" '.proxies[$g].all' <<<"$pjson")" || return 1
+  jq -nc --arg group "$group" --argjson nodes "$nodes" '{group:$group, nodes:$nodes}'
+}
+
+pick_and_switch_by_keyword() {
+  # 用法：mh <keyword>
+  local kw="${1:-}"
+  [[ -n "$kw" ]] || { warn "usage: mh <keyword>"; return 1; }
+
+  wait_api 5 || { warn "mihomo API not ready"; return 1; }
+
+  local gj group
+  gj="$(get_group_nodes_json)" || { warn "cannot read proxies/groups"; return 1; }
+  group="$(jq -r '.group' <<<"$gj")"
+
+  # 纯子串匹配：中文直接 contains；英文做 lower-case contains
+  local candidates
+  candidates="$(jq -r --arg kw "$kw" '
+    def lc: ascii_downcase;
+
+    .nodes
+    | map(select(. != "DIRECT" and . != "REJECT"))
+    | map(select(
+        (contains($kw))                       # 中文/原样子串
+        or ((lc) | contains($kw | lc))        # 英文忽略大小写
+      ))
+    | .[]
+  ' <<<"$gj")"
+
+  if [[ -z "$candidates" ]]; then
+    warn "No nodes matched keyword: $kw"
+    info "Tip: try: 美国 / 香港 / 日本 / 狮城 / 韩国 / 台湾 / US / HK / JP / SG"
+    return 1
+  fi
+
+  mapfile -t arr <<<"$candidates"
+
+  echo "🔎 Matched nodes in group [$group] for keyword: [$kw]"
+  local i
+  for i in "${!arr[@]}"; do
+    printf "  %d) %s\n" "$((i+1))" "${arr[$i]}"
+  done
+
+  local pick
+  while true; do
+    read -r -p "👉 choose (1-${#arr[@]}, 0 cancel): " pick
+    [[ "$pick" =~ ^[0-9]+$ ]] || { echo "❌ 请输入数字"; continue; }
+    (( pick==0 )) && { echo "cancelled"; return 0; }
+    (( pick>=1 && pick<=${#arr[@]} )) || { echo "❌ 超出范围"; continue; }
+    break
+  done
+
+  switch_group_node "$group" "${arr[$((pick-1))]}"
+  speedtest_now 1200 || true
+}
+
+
+help() {
+  cat <<EOF
+Usage:
+  $0 add <name> <url|file>     # 新建一个 profile 目录：${MIHOMO_ROOT}/<name>/
+                              # 生成 config.yaml，并把订阅作为 proxy-provider
+                              # <url>：在线订阅（type=http）
+                              # <file>：本地文件（type=file，会自动删 url/interval）
+
+  $0 select [name]             # 切换/启动某个 profile
+                              # 不带 name：列出目录，输入序号选择
+                              # 带 name：直接启动 ${MIHOMO_ROOT}/<name>/
+
+  $0 start <name>              # 直接启动指定 profile（等价于 select name）
+  $0 end                       # 停止当前 mihomo（用 ${PID_FILE}）
+
+  $0 on                        # 导出 HTTP_PROXY/HTTPS_PROXY 指向 127.0.0.1:${MIXED_PORT}
+  $0 off                       # 取消代理环境变量
+
+  $0                           # 显示端口监听情况 + 当前节点测速（需要 API 就绪）
+  $0 tnu [on|off|toggle]       Toggle TUN (writes tun: into current profile and restarts)
+  $0 -l | --list              # 列出主组(优先 Proxy)的所有节点，并标记当前节点
+  $0 美国                     # 模糊搜索节点并切换
+
+Tips:
+  - 如果刚启动就查节点失败，加了 wait_api 会更稳（避免 race）
+  - 当前节点显示 DIRECT 代表还没切到 provider 节点，或 provider 没拉到节点
+EOF
+}
+
+
+select_one(){ # select name
+  shift 
+  local name
+  if [[ -z "${1:-}" ]];then
+    local -a files
+    mapfile -t files < <(find "$MIHOMO_ROOT" -mindepth 1 -maxdepth 1 -type d  -exec test -f '{}/config.yaml' ';' -print | sort)
+    if (( ${#files[@]} == 0 )); then
+      echo "⚠️  ${MIHOMO_ROOT} 下没有找到任何 目录"
+      return 1
+    fi
+    echo "📄 可用配置（输入序号选择，例如 1）："
+    local i
+    for i in "${!files[@]}"; do
+      printf "  %d) %s\n" "$((i+1))" "$(basename "${files[$i]}")"
+    done
+
+    local pick 
+    while true; do
+      read -r -p "👉 请输入序号 (1-${#files[@]}): " pick
+      [[ "$pick" =~ ^[0-9]+$ ]] || { echo "❌ 请输入数字"; continue; }
+      (( pick>=1 && pick<=${#files[@]} )) || { echo "❌ 超出范围"; continue; }
+
+      name="$(basename "${files[$((pick-1))]}")"
+      break
+    done
+  else
+   local file_cfg="$MIHOMO_ROOT/$1"
+   if [[ -d $file_cfg ]];then
+    name="$1"
+   else
+    echo "❌ 不存在: $file_cfg"# 输入name有无
+    return 1
+   fi
+  fi
+    start_end "start" "$name"
+    echo "$name" > "${MIHOMO_ROOT}/current.profile"
+    wait_api 5 || warn "mihomo API not ready yet"
+    speedtest_now 1000
+
+}
+
+#====================tnu控制，下=========================
+
+current_profile() {
+  [[ -f "${MIHOMO_ROOT}/current.profile" ]] || return 1
+  cat "${MIHOMO_ROOT}/current.profile"
+}
+
+tnu() {
+  # 用法：mh tnu on|off|toggle
+  local action="${1:-toggle}"
+  local prof
+  prof="$(current_profile)" || { warn "no current profile"; return 1; }
+
+  local cfg="${MIHOMO_ROOT}/${prof}/config.yaml"
+  [[ -f "$cfg" ]] || { warn "missing config: $cfg"; return 1; }
+
+  local cur
+  cur="$(yq -r '.tun.enable // false' "$cfg" 2>/dev/null || echo false)"
+
+  local next
+  case "$action" in
+    on) next=true ;;
+    off) next=false ;;
+    toggle) [[ "$cur" == "true" ]] && next=false || next=true ;;
+    *) warn "usage: mh tnu on|off|toggle"; return 1 ;;
+  esac
+
+  yq -y -i "
+    .tun.enable = ${next} |
+    .tun.stack = (.tun.stack // \"system\") |
+    .tun.device = (.tun.device // \"mihomo\") |
+    .tun[\"auto-route\"] = (.tun[\"auto-route\"] // true) |
+    .tun[\"auto-detect-interface\"] = (.tun[\"auto-detect-interface\"] // true) |
+    .tun[\"dns-hijack\"] = (.tun[\"dns-hijack\"] // []) |
+    ( .tun[\"dns-hijack\"] |= ( . + [\"any:53\"] | unique ) ) |
+
+    .dns.enable = ${next} |
+    .dns.listen = (.dns.listen // \"127.0.0.1:1053\") |
+    .dns[\"enhanced-mode\"] = (.dns[\"enhanced-mode\"] // \"fake-ip\") |
+    .dns.nameserver = (.dns.nameserver // [\"223.5.5.5\",\"119.29.29.29\"]) |
+    .dns.fallback = (.dns.fallback // [\"1.1.1.1\",\"8.8.8.8\"])
+  " "$cfg"
+
+
+
+  info "TUN set to ${next} (profile=${prof}), restarting..."
+  start_end end
+  start_end start "$prof"
+  wait_api 5 || warn "mihomo API not ready"
+  print_mihomo_status 1200 || true
+}
+
+#=============================tnu控制，上===================
+
+list_nodes() {
+  # 用法：mh -l
+  wait_api 5 || { warn "mihomo API not ready"; return 1; }
+
+  local pjson group now
+  pjson="$(api_get "/proxies")" || { warn "cannot read /proxies"; return 1; }
+
+  group="$(get_main_group)" || { warn "cannot detect main group"; return 1; }
+  now="$(jq -r --arg g "$group" '.proxies[$g].now // ""' <<<"$pjson")"
+
+  echo "📌 Group: ${group}"
+  [[ -n "$now" ]] && echo "⭐ Now:   ${now}"
+  echo
+
+  # 列出 all 节点，排除 DIRECT/REJECT 的话可以加过滤；这里默认全列出并标记当前
+  jq -r --arg g "$group" --arg now "$now" '
+    .proxies[$g].all
+    | to_entries[]
+    | "\(.key + 1)) " + (if .value == $now then "⭐ " else "   " end) + .value
+  ' <<<"$pjson"
+}
+
+
+
+#===============================搜索测速排序，下======================
+# 批量测延迟（默认并发 6），输出："<delay>\t<node>"
+batch_delay() {
+  # 用法：batch_delay <timeout_ms> <max_jobs> <node1> <node2> ...
+  local timeout_ms="${1:-1200}"; shift || true
+  local max_jobs="${1:-6}"; shift || true
+  local -a nodes=( "$@" )
+
+  # 兼容：没有节点直接返回
+  (( ${#nodes[@]} == 0 )) && return 0
+
+  # 并发测
+  local tmp
+  tmp="$(mktemp)"
+  rm -f "$tmp"; : >"$tmp"
+
+  # 简单并发控制：后台跑，超过 max_jobs 就 wait 一个
+  local running=0
+  for n in "${nodes[@]}"; do
+    (
+      local d
+      d="$(api_delay "$n" "$timeout_ms")"
+      # 统一成数值："-" 变成 999999，便于排序
+      if [[ "$d" =~ ^[0-9]+$ ]]; then
+        printf "%s\t%s\n" "$d" "$n"
+      else
+        printf "999999\t%s\n" "$n"
+      fi
+    ) >>"$tmp" &
+    running=$((running+1))
+    if (( running >= max_jobs )); then
+      wait -n 2>/dev/null || wait
+      running=$((running-1))
+    fi
+  done
+  wait
+
+  # 排序输出
+  sort -n "$tmp"
+  rm -f "$tmp"
+}
+
+# 关键词匹配 + 测速排序 + 选择切换
+pick_switch_with_delay() {
+  # 用法：pick_switch_with_delay "<keyword>" [timeout_ms]
+  local kw="${1:-}"
+  local timeout_ms="${2:-1200}"
+  [[ -n "$kw" ]] || { warn "usage: mh <keyword>"; return 1; }
+
+  wait_api 5 || { warn "mihomo API not ready"; return 1; }
+
+  local gj group
+  gj="$(get_group_nodes_json)" || { warn "cannot read proxies/groups"; return 1; }
+  group="$(jq -r '.group' <<<"$gj")"
+
+  # 匹配候选：中文用 contains；英文用 lower-case contains
+  local candidates
+  candidates="$(jq -r --arg kw "$kw" '
+    def lc: ascii_downcase;
+    .nodes
+    | map(select(. != "DIRECT" and . != "REJECT"))
+    | map(select(
+        (contains($kw)) or ((lc) | contains($kw | lc))
+      ))
+    | .[]
+  ' <<<"$gj")"
+
+  if [[ -z "$candidates" ]]; then
+    warn "No nodes matched keyword: $kw"
+    info "Tip: try: 美国 / 香港 / 日本 / 狮城 / 韩国 / 台湾 / US / HK / JP / SG"
+    return 1
+  fi
+
+  mapfile -t arr <<<"$candidates"
+
+  info "Testing delay for ${#arr[@]} nodes (timeout=${timeout_ms}ms)..."
+  # 并发 6：你可以改大/改小
+  local lines
+  lines="$(batch_delay "$timeout_ms" 6 "${arr[@]}")"
+
+  # 组装排序后的节点数组（按 delay asc）
+  local -a sorted_nodes=()
+  local -a sorted_delay=()
+  while IFS=$'\t' read -r d n; do
+    sorted_nodes+=( "$n" )
+    sorted_delay+=( "$d" )
+  done <<<"$lines"
+
+  echo "🔎 Matched nodes in group [$group] for keyword: [$kw]  (sorted by delay)"
+  local i showd
+  for i in "${!sorted_nodes[@]}"; do
+    showd="${sorted_delay[$i]}"
+    [[ "$showd" == "999999" ]] && showd="-"   # 显示时还原
+    printf "  %d) %s\t%s ms\n" "$((i+1))" "${sorted_nodes[$i]}" "$showd"
+  done
+
+  local pick
+  while true; do
+    read -r -p "👉 choose (1-${#sorted_nodes[@]}, 0 cancel): " pick
+    [[ "$pick" =~ ^[0-9]+$ ]] || { echo "❌ 请输入数字"; continue; }
+    (( pick==0 )) && { echo "cancelled"; return 0; }
+    (( pick>=1 && pick<=${#sorted_nodes[@]} )) || { echo "❌ 超出范围"; continue; }
+    break
+  done
+
+  switch_group_node "$group" "${sorted_nodes[$((pick-1))]}"
+  speedtest_now 1500 || true
+}
+
+
+
+#==============================搜索测速排序，上======================
+
+#============================状态检查，下=====================
+detect_tun_ifaces() {
+  # 输出检测到的 TUN/TAP 接口名；没有则空
+  local out=""
+
+  # 1) ip link：匹配 tun/utun/tap（忽略大小写）
+  out="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' \
+    | grep -iE '(^tun[0-9]*$|^utun[0-9]*$|^tap[0-9]*$|tun|utun|tap|mihomo|clash|meta)' || true)"
+
+  if [[ -n "$out" ]]; then
+    echo "$out" | sed '/^$/d' | sort -u
+    return 0
+  fi
+
+  # 2) ip tuntap：更权威（有些发行版默认不装 iproute2 的 tuntap 子命令，失败就忽略）
+  if ip tuntap show >/dev/null 2>&1; then
+    ip tuntap show | awk '{print $1}' | sed '/^$/d' | sort -u
+    return 0
+  fi
+
+  # 3) /sys/class/net：兜底
+  ls /sys/class/net 2>/dev/null | grep -iE '(^tun[0-9]*$|^utun[0-9]*$|^tap[0-9]*$|tun|utun|tap|mihomo|clash|meta)' || true
+}
+
+tun_status() {
+  local prof cfg enabled
+  prof="$(current_profile 2>/dev/null || true)"
+  if [[ -z "$prof" ]]; then
+    echo "TUN: unknown (no current profile)"
+    return 0
+  fi
+
+  cfg="${MIHOMO_ROOT}/${prof}/config.yaml"
+  if [[ ! -f "$cfg" ]]; then
+    echo "TUN: unknown (missing config)"
+    return 0
+  fi
+
+  enabled="$(yq -r '.tun.enable // false' "$cfg" 2>/dev/null || echo false)"
+
+  # 配置状态
+  if [[ "$enabled" != "true" ]]; then
+    echo "TUN: OFF (profile=${prof})"
+    return 0
+  fi
+
+  # 运行态：接口
+  local ifs
+  ifs="$(detect_tun_ifaces || true)"
+  if [[ -z "$ifs" ]]; then
+    echo "TUN: ON in config, but NO tun/tap iface found (profile=${prof})"
+  else
+    echo "TUN: ON (profile=${prof})"
+    echo "TUN ifaces:"
+    echo "$ifs" | sed 's/^/  - /'
+  fi
+
+  # 运行态：默认路由（是否被接管）
+  echo "Default route:"
+  ip route show default 2>/dev/null | sed 's/^/  /' || true
+}
+
+
+proxy_env_status() {
+  if [[ -n "${HTTP_PROXY:-}" || -n "${HTTPS_PROXY:-}" ]]; then
+    echo "Proxy ENV: ON  (HTTP_PROXY=${HTTP_PROXY:-<unset>}  HTTPS_PROXY=${HTTPS_PROXY:-<unset>})"
+  else
+    echo "Proxy ENV: OFF"
+  fi
+}
+
+net_test() {
+  # 验证：环境变量代理是否生效 + 通过代理访问 google
+  # 1) 走系统环境（如果你 mh on 了）
+  echo "== Test via ENV proxy (if enabled) =="
+  curl -I -m 10  https://www.cloudflare.com | head -n 1 || echo "❌ ENV proxy path failed"
+
+  # 2) 强制走 mihomo mixed-port（不依赖你是否 export）
+  echo
+  echo "== Test via explicit proxy http://127.0.0.1:${MIXED_PORT} =="
+  curl -I -m 10 -x "http://127.0.0.1:${MIXED_PORT}" https://www.cloudflare.com | head -n 1 || echo "❌ explicit proxy failed"
+  echo
+  echo "== Current node delay (mihomo API) =="
+  speedtest_now 1500 || true
+}
+
+
+#============================状态检查，上=====================
+main() {
+    if [[ -z "${1:-}"  ]]; then
+        ss -lntp | grep -E ':(9090|7890)'|| echo "❌ 未找到代理服务"
+        test_env
+        tun_status
+        proxy_env_status
+        speedtest_now 1000
+        # print_mihomo_status
+        exit 0
+    fi
+  case "${1:-}" in
+    add) 
+        cfg_add "$@";;
+    on|off)
+        on_off "$@";;
+    start|end)
+        start_end "$@";;
+    select)
+        select_one "$@";;
+    help|-h|--help) help ;;
+    -l|--list|list) list_nodes ;;
+    tnu) shift; tnu "${1:-toggle}" ;;
+    test) net_test ;;
+    # *) pick_and_switch_by_keyword "${1:-}" ;;
+    *) pick_switch_with_delay "${1:-}" 1200 ;;
+  esac
+}
+
+main "$@"
