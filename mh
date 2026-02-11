@@ -13,12 +13,6 @@ API_BASE="http://${API_HOST}:${API_PORT}"
 API_SECRET="" # 这是密钥，用于验证；对应yaml中设置的secret字段，保持一致即可；如果不设置，默认空字符串，表示不验证
 
 # 简单彩色（不喜欢颜色就把这些变量都设为空字符串）
-c_reset=$'\e[0m'
-c_title=$'\e[1;36m'
-c_key=$'\e[1;33m'
-c_ok=$'\e[1;32m'
-c_warn=$'\e[1;31m'
-c_dim=$'\e[2m'
 urlenc() {
   python3 - <<'PY' "$1"
 import sys, urllib.parse
@@ -62,10 +56,11 @@ test_port() {
   done
 }
 api_get() {
+  local path="$1"
   if [[ -n "${API_SECRET}" ]]; then
-    curl -fsS -H "Authorization: Bearer ${API_SECRET}" "${API_BASE}$1"
+    curl -fsS --noproxy '*' -H "Authorization: Bearer ${API_SECRET}" "${API_BASE}${path}"
   else
-    curl -fsS "${API_BASE}$1"
+    curl -fsS --noproxy '*' "${API_BASE}${path}"
   fi
 }
 
@@ -73,12 +68,17 @@ api_put() {
   local path="$1"
   local data="$2"
   if [[ -n "${API_SECRET}" ]]; then
-    curl -fsS -X PUT -H "Authorization: Bearer ${API_SECRET}" -H 'Content-Type: application/json' \
+    curl -fsS --noproxy '*' -X PUT \
+      -H "Authorization: Bearer ${API_SECRET}" \
+      -H 'Content-Type: application/json' \
       -d "$data" "${API_BASE}${path}"
   else
-    curl -fsS -X PUT -H 'Content-Type: application/json' -d "$data" "${API_BASE}${path}"
+    curl -fsS --noproxy '*' -X PUT \
+      -H 'Content-Type: application/json' \
+      -d "$data" "${API_BASE}${path}"
   fi
 }
+
 
 api_delay() {
   local name="$1"
@@ -102,6 +102,19 @@ switch_group_node() {
 
   api_put "/proxies/${enc_group}" "$(jq -nc --arg name "$node" '{name:$name}')" >/dev/null
   info "Switched group [$group] -> [$node]"
+}
+
+need_root() {
+  # 用法：need_root "sudo -E $0 tun on"
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    warn "此操作需要 sudo/root 权限"
+    warn "请用 sudo 运行："
+    warn "  $1"
+    warn "或给 mihomo 二进制加能力（不必整进程 root）："
+    warn "  sudo setcap cap_net_admin,cap_net_raw+ep \"$MIHOMO_BIN\""
+    return 1
+  fi
+  return 0
 }
 #===============测试小工具，上======================================
 
@@ -228,86 +241,39 @@ YAML
 
 #=====================mihomo配置，上====================================
 print_mihomo_status() {
-  local timeout_ms="${1:-2000}"
+  local cfg pjson
+  cfg="$(api_get "/configs" 2>/dev/null)" || { echo "❌ API 不通: ${API_BASE}"; return 1; }
+  pjson="$(api_get "/proxies" 2>/dev/null)" || { echo "❌ 读取 /proxies 失败"; return 1; }
 
-  # 1) configs：运行态端口/LAN/mode
-  local cfg
-  if ! cfg="$(api_get "/configs")"; then
-    echo "${c_warn}✗ Cannot reach mihomo API at ${API_BASE}${c_reset}"
-    return 1
-  fi
-
-  local allow_lan bind_addr mode log_level mixed_port ec
+  local allow_lan bind_addr mode mixed_port ec
   allow_lan="$(jq -r '."allow-lan" // false' <<<"$cfg")"
   bind_addr="$(jq -r '."bind-address" // "-"' <<<"$cfg")"
   mode="$(jq -r '.mode // "-"' <<<"$cfg")"
-  log_level="$(jq -r '."log-level" // "-"' <<<"$cfg")"
   mixed_port="$(jq -r '."mixed-port" // .port // "-"' <<<"$cfg")"
   ec="$(jq -r '."external-controller" // "-"' <<<"$cfg")"
 
-  local lan_badge
-  if [[ "$allow_lan" == "true" ]]; then
-    lan_badge="${c_ok}ON${c_reset}"
-  else
-    lan_badge="${c_warn}OFF${c_reset}"
-  fi
+  local group now node_count
+  group="$(get_main_group 2>/dev/null || true)"
+  [[ -n "$group" ]] || { echo "❌ 找不到主组（/proxies 里没有可用 group）"; return 1; }
 
-  # 2) proxies：找主组 + now + all（节点列表）
-  local pjson
-  pjson="$(api_get "/proxies")" || { echo "${c_warn}✗ Cannot read /proxies${c_reset}"; return 1; }
-
-  # 自动选“主组”：优先 Selector/URLTest/Fallback/LoadBalance，其次任意有 all 的
-  local group
-  group="$(jq -r '
-    .proxies
-    | to_entries
-    | map(select(.value.all? != null))
-    | (map(select(.value.type?=="Selector" or .value.type?=="URLTest" or .value.type?=="Fallback" or .value.type?=="LoadBalance")) + .)
-    | .[0].key // empty
-  ' <<<"$pjson")"
-
-  if [[ -z "$group" ]]; then
-    echo "${c_warn}✗ No proxy groups found in /proxies (unexpected)${c_reset}"
-    return 1
-  fi
-
-  local now node_count
   now="$(jq -r --arg g "$group" '.proxies[$g].now // "-"' <<<"$pjson")"
   node_count="$(jq -r --arg g "$group" '.proxies[$g].all | length' <<<"$pjson" 2>/dev/null || echo "-")"
 
-  # 3) 当前节点 delay（DIRECT/REJECT 不测）
-  local now_delay="-"
-  if [[ "$now" != "-" && "$now" != "DIRECT" && "$now" != "REJECT" ]]; then
-    now_delay="$(api_delay "$now" "$timeout_ms")"
-  fi
+  local lan_icon="🔒"
+  [[ "$allow_lan" == "true" ]] && lan_icon="📡"
 
-  # 4) 好看输出
-  echo
-  echo "${c_title}╔══════════════════════════════ Mihomo Live Status ══════════════════════════════╗${c_reset}"
-  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "API" "${API_BASE}  ${c_dim}(external-controller=${ec})${c_reset}"
-  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "Ports" "mixed-port=${mixed_port}"
-  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "LAN" "allow-lan=${lan_badge}  bind=${bind_addr}"
-  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "Mode / Log" "mode=${mode}  log-level=${log_level}"
-  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "Main Group" "${group}"
-  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "Nodes" "count=${node_count}"
-  printf "${c_key}║%-16s${c_reset} %-58s ║\n" "Now Using" "${now}  ${c_dim}(delay=${now_delay}ms)${c_reset}"
-  echo "${c_title}╚═══════════════════════════════════════════════════════════════════════════════╝${c_reset}"
-  echo
+  echo "🧠 Mihomo Status"
+  echo "🌐 API:   ${API_BASE}  (EC=${ec})"
+  echo "🚪 Port:  mixed-port=${mixed_port}"
+  echo "${lan_icon} LAN:   allow-lan=${allow_lan}  bind=${bind_addr}"
+  echo "🧭 Mode:  ${mode}"
+  echo "🧩 Group: ${group}"
+  echo "📦 Nodes: ${node_count}"
+  echo "✅ Now:   ${now}"
 }
 
-on_off() { # 启动/停止代理，
-    if [[ "$1" == "on" ]]; then
-        export HTTP_PROXY="http://${API_HOST}:${MIXED_PORT}"
-        export HTTPS_PROXY="http://${API_HOST}:${MIXED_PORT}"
-        info "Proxy ON: HTTP_PROXY and HTTPS_PROXY set to ${API_HOST}:${MIXED_PORT}"
-        speedtest_now 1000
-    elif [[ "$1" == "off" ]]; then
-        unset HTTP_PROXY HTTPS_PROXY
-        info "Proxy OFF: HTTP_PROXY and HTTPS_PROXY unset"
-    else
-        die "usage: $0 on|off"
-    fi
-}
+
+
 start_end(){  # start/end name/none 文件
     local start0Rend=$1
     local name_file=${2:-}
@@ -318,9 +284,8 @@ start_end(){  # start/end name/none 文件
             # 进入的前提配置没有问题，可以直接运行
             info "start mihomo with config=$cfg/config.yaml data=$cfg"
             # 前台跑不方便，这里后台启动并记录 pid
-            test_port "$API_PORT" "$MIXED_PORT"
-            "$MIHOMO_BIN" -d "$cfg" >"$cfg/mihomo.log" 2>&1 & # 每次启动情况记录
-            # on_off on
+            test_port "$API_PORT" "$MIXED_PORT" "$SOCK_PORT"
+            "$MIHOMO_BIN" -d "$cfg" -f "$cfg/config.yaml" >"$cfg/mihomo.log" 2>&1 & # 每次启动情况记录
             echo $! >"$PID_FILE" # 保存到定点位置
         fi
     elif [[ "$start0Rend" == "end" ]]; then
@@ -341,7 +306,6 @@ start_end(){  # start/end name/none 文件
               fi
             fi
             rm -f "$PID_FILE"
-            # on_off off
         fi
     else
         die "usage: $0 start|end"
@@ -389,85 +353,132 @@ get_group_nodes_json() {
   jq -nc --arg group "$group" --argjson nodes "$nodes" '{group:$group, nodes:$nodes}'
 }
 
-pick_and_switch_by_keyword() {
-  # 用法：mh <keyword>
-  local kw="${1:-}"
-  [[ -n "$kw" ]] || { warn "usage: mh <keyword>"; return 1; }
-
-  wait_api 5 || { warn "mihomo API not ready"; return 1; }
-
-  local gj group
-  gj="$(get_group_nodes_json)" || { warn "cannot read proxies/groups"; return 1; }
-  group="$(jq -r '.group' <<<"$gj")"
-
-  # 纯子串匹配：中文直接 contains；英文做 lower-case contains
-  local candidates
-  candidates="$(jq -r --arg kw "$kw" '
-    def lc: ascii_downcase;
-
-    .nodes
-    | map(select(. != "DIRECT" and . != "REJECT"))
-    | map(select(
-        (contains($kw))                       # 中文/原样子串
-        or ((lc) | contains($kw | lc))        # 英文忽略大小写
-      ))
-    | .[]
-  ' <<<"$gj")"
-
-  if [[ -z "$candidates" ]]; then
-    warn "No nodes matched keyword: $kw"
-    info "Tip: try: 美国 / 香港 / 日本 / 狮城 / 韩国 / 台湾 / US / HK / JP / SG"
-    return 1
-  fi
-
-  mapfile -t arr <<<"$candidates"
-
-  echo "🔎 Matched nodes in group [$group] for keyword: [$kw]"
-  local i
-  for i in "${!arr[@]}"; do
-    printf "  %d) %s\n" "$((i+1))" "${arr[$i]}"
-  done
-
-  local pick
-  while true; do
-    read -r -p "👉 choose (1-${#arr[@]}, 0 cancel): " pick
-    [[ "$pick" =~ ^[0-9]+$ ]] || { echo "❌ 请输入数字"; continue; }
-    (( pick==0 )) && { echo "cancelled"; return 0; }
-    (( pick>=1 && pick<=${#arr[@]} )) || { echo "❌ 超出范围"; continue; }
-    break
-  done
-
-  switch_group_node "$group" "${arr[$((pick-1))]}"
-  speedtest_now 1200 || true
-}
-
 
 help() {
   cat <<EOF
+✅ 复制粘贴到你的 shell 启动文件（见下方“该改哪个文件”）：
+
+# ====== MIHOMO PROXY ENV BEGIN ======
+export http_proxy="http://127.0.0.1:${MIXED_PORT}"
+export https_proxy="http://127.0.0.1:${MIXED_PORT}"
+export all_proxy="socks5h://127.0.0.1:${MIXED_PORT}"
+
+export HTTP_PROXY="\$http_proxy"
+export HTTPS_PROXY="\$https_proxy"
+export ALL_PROXY="\$all_proxy"
+
+# 避免本地/内网/控制端口走代理（按需加减）
+export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+export no_proxy="\$NO_PROXY"
+# ====== MIHOMO PROXY ENV END ======
+
+应用方法（改完文件后执行其一）：
+  source ~/.bashrc
+  source ~/.zshrc
+  exec \$SHELL -l
+
+-------------------------------------------------------------------------------
+该改哪个文件？（尽量准确 + 兜底）
+
+1) 先看你当前是什么 shell：
+  echo "\$SHELL"
+  ps -p \$\$ -o comm=
+
+2) 尝试自动判断“这次会读哪个 rc 文件”（不保证 100% 准确，但很实用）：
+  # bash：看看是不是 login shell
+  shopt -q login_shell && echo "login shell" || echo "non-login shell"
+
+  # zsh：看看 ZDOTDIR / 以及默认读 ~/.zshrc
+  echo "ZDOTDIR=\${ZDOTDIR:-<unset>}"
+
+3) 常见规则（按你当前情况选一个文件写入）：
+  - bash + 交互式非登录 shell（多数终端 tab）：~/.bashrc
+  - bash + 登录 shell（ssh 登录 / 有些终端配置）：~/.bash_profile 或 ~/.profile
+  - zsh（mac 常见）：~/.zshrc
+  - 如果你不确定：
+      a) bash：同时写 ~/.bashrc 和 ~/.bash_profile（bash_profile 里最好加一行：[[ -f ~/.bashrc ]] && source ~/.bashrc）
+      b) zsh：写 ~/.zshrc
+
+验证是否生效（新开终端或 source 后）：
+  echo \$http_proxy
+  env | grep -iE 'http_proxy|https_proxy|all_proxy|no_proxy'
+
+-------------------------------------------------------------------------------
+
 Usage:
-  $0 add <name> <url|file>     # 新建一个 profile 目录：${MIHOMO_ROOT}/<name>/
-                              # 生成 config.yaml，并把订阅作为 proxy-provider
-                              # <url>：在线订阅（type=http）
-                              # <file>：本地文件（type=file，会自动删 url/interval）
+  mh [command] [args...]
 
-  $0 select [name]             # 切换/启动某个 profile
-                              # 不带 name：列出目录，输入序号选择
-                              # 带 name：直接启动 ${MIHOMO_ROOT}/<name>/
+Commands:
+  add <name> <url|file>
+      新建一个 profile 目录：${MIHOMO_ROOT}/<name>/
+      - 生成 config.yaml
+      - 把订阅作为 proxy-provider
+      - <url>  在线订阅（type=http）
+      - <file> 本地文件（type=file，会自动删 url/interval）
 
-  $0 start <name>              # 直接启动指定 profile（等价于 select name）
-  $0 end                       # 停止当前 mihomo（用 ${PID_FILE}）
+  select [name]
+      切换/启动某个 profile
+      - 不带 name：列出目录，输入序号选择
+      - 带 name：直接启动 ${MIHOMO_ROOT}/<name>/
 
-  $0 on                        # 导出 HTTP_PROXY/HTTPS_PROXY 指向 127.0.0.1:${MIXED_PORT}
-  $0 off                       # 取消代理环境变量
+  start <name>
+      直接启动指定 profile（等价于：select <name>）
 
-  $0                           # 显示端口监听情况 + 当前节点测速（需要 API 就绪）
-  $0 tnu [on|off|toggle]       Toggle TUN (writes tun: into current profile and restarts)
-  $0 -l | --list              # 列出主组(优先 Proxy)的所有节点，并标记当前节点
-  $0 美国                     # 模糊搜索节点并切换
+  end
+      停止当前 mihomo（通过 ${PID_FILE} 记录的 pid）
 
-Tips:
-  - 如果刚启动就查节点失败，加了 wait_api 会更稳（避免 race）
-  - 当前节点显示 DIRECT 代表还没切到 provider 节点，或 provider 没拉到节点
+  tun [on|off|toggle]
+      开关 TUN（会写入当前 profile 的 config.yaml 并重启）
+      - 开启 TUN 通常需要 sudo/root 或给 mihomo 加能力：
+          sudo setcap cap_net_admin,cap_net_raw+ep "<mihomo_bin>"
+
+  -l | --list | list
+      列出主组(优先 Proxy)的所有节点，并标记当前节点
+
+  <keyword>
+      模糊搜索节点名称并测速排序后让你选择切换
+      例如：
+        mh 美国
+        mh 香港
+        mh JP
+        mh SG
+
+No-args (默认行为):
+  直接显示：
+    - TUN 状态
+    - 当前环境是否存在 HTTP_PROXY/HTTPS_PROXY
+    - 当前节点延迟测速（通过 mihomo API）
+
+-------------------------------------------------------------------------------
+
+Examples:
+  # 添加订阅（在线）
+  mh add tnt "https://example.com/sub.yaml"
+
+  # 添加订阅（本地文件）
+  mh add local "/path/to/sub.yaml"
+
+  # 启动/切换 profile
+  mh select
+  mh select tnt
+
+  # 停止 mihomo
+  mh end
+
+  # 查看节点列表
+  mh -l
+
+  # 按关键词筛选并测速排序后切换
+  mh 美国
+
+  # TUN 开关
+  sudo mh tun on
+  sudo mh tun off
+  mh tun toggle
+
+Notes:
+  - API 不通时，很多功能会失败：确保 mihomo 正在运行且 external-controller 为 ${API_HOST}:${API_PORT}
+  - 如果刚启动就查询失败，wait_api 会稍等 mihomo API 就绪（避免 race）
 EOF
 }
 
@@ -513,15 +524,15 @@ select_one(){ # select name
 
 }
 
-#====================tnu控制，下=========================
+#====================tun控制，下=========================
 
 current_profile() {
   [[ -f "${MIHOMO_ROOT}/current.profile" ]] || return 1
   cat "${MIHOMO_ROOT}/current.profile"
 }
 
-tnu() {
-  # 用法：mh tnu on|off|toggle
+tun() {
+  # 用法：sudo mh tun on|off|toggle
   local action="${1:-toggle}"
   local prof
   prof="$(current_profile)" || { warn "no current profile"; return 1; }
@@ -537,26 +548,27 @@ tnu() {
     on) next=true ;;
     off) next=false ;;
     toggle) [[ "$cur" == "true" ]] && next=false || next=true ;;
-    *) warn "usage: mh tnu on|off|toggle"; return 1 ;;
+    *) warn "usage: mh tun on|off|toggle"; return 1 ;;
   esac
-
+  if [[ "$next" == "true" ]]; then  # 只有“要开启 tun”才提示/要求 sudo
+    need_root "sudo -E \"$0\" tun ${action}" || return 1
+  fi
   yq -y -i "
     .tun.enable = ${next} |
     .tun.stack = (.tun.stack // \"system\") |
     .tun.device = (.tun.device // \"mihomo\") |
     .tun[\"auto-route\"] = (.tun[\"auto-route\"] // true) |
+    .tun[\"auto-redir\"] = (.tun[\"auto-redir\"] // true) |
     .tun[\"auto-detect-interface\"] = (.tun[\"auto-detect-interface\"] // true) |
     .tun[\"dns-hijack\"] = (.tun[\"dns-hijack\"] // []) |
     ( .tun[\"dns-hijack\"] |= ( . + [\"any:53\"] | unique ) ) |
 
     .dns.enable = ${next} |
     .dns.listen = (.dns.listen // \"127.0.0.1:1053\") |
-    .dns[\"enhanced-mode\"] = (.dns[\"enhanced-mode\"] // \"fake-ip\") |
+    .dns[\"enhanced-mode\"] = \"redir-host\" |
     .dns.nameserver = (.dns.nameserver // [\"223.5.5.5\",\"119.29.29.29\"]) |
     .dns.fallback = (.dns.fallback // [\"1.1.1.1\",\"8.8.8.8\"])
   " "$cfg"
-
-
 
   info "TUN set to ${next} (profile=${prof}), restarting..."
   start_end end
@@ -565,7 +577,7 @@ tnu() {
   print_mihomo_status 1200 || true
 }
 
-#=============================tnu控制，上===================
+#=============================tun控制，上===================
 
 list_nodes() {
   # 用法：mh -l
@@ -705,66 +717,35 @@ pick_switch_with_delay() {
 #==============================搜索测速排序，上======================
 
 #============================状态检查，下=====================
-detect_tun_ifaces() {
-  # 输出检测到的 TUN/TAP 接口名；没有则空
-  local out=""
-
-  # 1) ip link：匹配 tun/utun/tap（忽略大小写）
-  out="$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' \
-    | grep -iE '(^tun[0-9]*$|^utun[0-9]*$|^tap[0-9]*$|tun|utun|tap|mihomo|clash|meta)' || true)"
-
-  if [[ -n "$out" ]]; then
-    echo "$out" | sed '/^$/d' | sort -u
-    return 0
-  fi
-
-  # 2) ip tuntap：更权威（有些发行版默认不装 iproute2 的 tuntap 子命令，失败就忽略）
-  if ip tuntap show >/dev/null 2>&1; then
-    ip tuntap show | awk '{print $1}' | sed '/^$/d' | sort -u
-    return 0
-  fi
-
-  # 3) /sys/class/net：兜底
-  ls /sys/class/net 2>/dev/null | grep -iE '(^tun[0-9]*$|^utun[0-9]*$|^tap[0-9]*$|tun|utun|tap|mihomo|clash|meta)' || true
-}
-
 tun_status() {
-  local prof cfg enabled
+  local prof cfg enabled dev
   prof="$(current_profile 2>/dev/null || true)"
-  if [[ -z "$prof" ]]; then
-    echo "TUN: unknown (no current profile)"
-    return 0
-  fi
+  [[ -n "$prof" ]] || { echo "TUN: unknown (no current profile)"; return 0; }
 
   cfg="${MIHOMO_ROOT}/${prof}/config.yaml"
-  if [[ ! -f "$cfg" ]]; then
-    echo "TUN: unknown (missing config)"
-    return 0
-  fi
+  [[ -f "$cfg" ]] || { echo "TUN: unknown (missing config)"; return 0; }
 
   enabled="$(yq -r '.tun.enable // false' "$cfg" 2>/dev/null || echo false)"
+  dev="$(yq -r '.tun.device // "mihomo"' "$cfg" 2>/dev/null || echo mihomo)"
 
-  # 配置状态
   if [[ "$enabled" != "true" ]]; then
     echo "TUN: OFF (profile=${prof})"
     return 0
   fi
 
-  # 运行态：接口
-  local ifs
-  ifs="$(detect_tun_ifaces || true)"
-  if [[ -z "$ifs" ]]; then
-    echo "TUN: ON in config, but NO tun/tap iface found (profile=${prof})"
+  echo "TUN: ON (profile=${prof})"
+  echo "Expect iface: ${dev}"
+
+  if ip link show "$dev" >/dev/null 2>&1; then
+    echo "Iface: ✅ ${dev} exists"
   else
-    echo "TUN: ON (profile=${prof})"
-    echo "TUN ifaces:"
-    echo "$ifs" | sed 's/^/  - /'
+    echo "Iface: ❌ ${dev} not found (mihomo tun may not be running/privileged)"
   fi
 
-  # 运行态：默认路由（是否被接管）
   echo "Default route:"
   ip route show default 2>/dev/null | sed 's/^/  /' || true
 }
+
 
 
 proxy_env_status() {
@@ -776,26 +757,188 @@ proxy_env_status() {
 }
 
 net_test() {
-  # 验证：环境变量代理是否生效 + 通过代理访问 google
-  # 1) 走系统环境（如果你 mh on 了）
-  echo "== Test via ENV proxy (if enabled) =="
-  curl -I -m 10  https://www.cloudflare.com | head -n 1 || echo "❌ ENV proxy path failed"
+  # 常用网站连通性测试：输出 “URL -> OK/FAIL”
+  local -a urls=(
+    "https://www.google.com"
+    "https://www.cloudflare.com"
+    "https://www.github.com"
+    "https://www.youtube.com"
+    "https://www.baidu.com"
+    "https://www.bing.com"
+  )
 
-  # 2) 强制走 mihomo mixed-port（不依赖你是否 export）
-  echo
-  echo "== Test via explicit proxy http://127.0.0.1:${MIXED_PORT} =="
-  curl -I -m 10 -x "http://127.0.0.1:${MIXED_PORT}" https://www.cloudflare.com | head -n 1 || echo "❌ explicit proxy failed"
-  echo
-  echo "== Current node delay (mihomo API) =="
-  speedtest_now 1500 || true
+  echo "== Net Test (timeout=10s) =="
+  local url
+  for url in "${urls[@]}"; do
+    if curl -fsS -I -m 10 "$url" >/dev/null 2>&1; then
+      printf "%s -> ✅ OK\n" "$url"
+    else
+      printf "%s -> ❌ FAIL\n" "$url"
+    fi
+  done
+}
+
+net_test_double() {
+  local -a urls=(
+    "https://www.google.com"
+    "https://www.cloudflare.com"
+    "https://www.github.com"
+    "https://www.youtube.com"
+    "https://www.baidu.com"
+    "https://www.bing.com"
+  )
+
+  echo "== Net Test (timeout=10s) =="
+  echo "Format: URL -> DIRECT | PROXY(mixed-port=${MIXED_PORT})"
+  local url ok1 ok2
+
+  for url in "${urls[@]}"; do
+    # 直连（完全忽略环境代理）
+    if curl -fsS -I -m 10 --noproxy '*' "$url" >/dev/null 2>&1; then
+      ok1="✅"
+    else
+      ok1="❌"
+    fi
+
+    # 强制走 mihomo mixed-port（明确指定代理）
+    if curl -fsS -I -m 10 -x "http://127.0.0.1:${MIXED_PORT}" "$url" >/dev/null 2>&1; then
+      ok2="✅"
+    else
+      ok2="❌"
+    fi
+
+    printf "%-28s -> DIRECT:%s  PROXY:%s\n" "$url" "$ok1" "$ok2"
+  done
 }
 
 
 #============================状态检查，上=====================
+
+#=========================debug,下===============================
+debug_one() {
+  shift
+
+  local -a debug_code=()
+  debug_code[1]="ss -lntp | grep -E ':(9090|9091|7890|7891)'|| echo \"❌ 未找到代理服务\""
+  debug_code[2]="ps -fp \${1:-} -o pid,ppid,cmd"
+  debug_code[3]="net_test"
+  debug_code[4]="net_test_double"
+  debug_code[5]="test_env"
+  debug_code[6]="ip -o link show"
+  debug_code[7]="resolvectl status 2>/dev/null | sed -n '1,120p' || cat /etc/resolv.conf"
+
+  local -a debug_desc=()
+  debug_desc[1]="检查 9090/9091/7890 端口监听:"
+  debug_desc[2]="查看指定 PID 的进程信息:"
+  debug_desc[3]="测试一下网络(仅proxy)"
+  debug_desc[4]="测试一下网络(直连+proxy)"
+  debug_desc[5]="测试需要的软件是否安装:"
+  debug_desc[6]="看看是否有虚拟网卡 mihomo:"
+  debug_desc[7]="dns debug"
+
+  echo "== debug list =="
+  local i
+  for i in "${!debug_code[@]}"; do
+    printf "  [%s] %s\n      %s\n" "$i" "${debug_desc[$i]:-}" "${debug_code[$i]}"
+  done
+  local idx
+  read -r -p "select index: " idx
+
+  for i in "${!debug_code[@]}"; do
+    if [[ "$i" == "$idx" ]]; then
+      echo "== run [$i] =="
+      eval "${debug_code[$i]}"
+      return $?
+    fi
+  done
+
+  echo "invalid index: $idx"
+  return 1
+}
+
+proxy_on() {
+  export http_proxy="http://127.0.0.1:${MIXED_PORT}"
+  export https_proxy="http://127.0.0.1:${MIXED_PORT}"
+  export all_proxy="socks5h://127.0.0.1:${MIXED_PORT}"
+
+  export HTTP_PROXY="$http_proxy"
+  export HTTPS_PROXY="$https_proxy"
+  export ALL_PROXY="$all_proxy"
+# 设置no，是为了避免mihomo自己访问自己
+  export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  export no_proxy="$NO_PROXY"
+}
+
+proxy_off() {
+  unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY no_proxy
+}
+
+
+# proxy_env() {
+#   local action="${1:-}"
+#   local bashrc="${HOME}/.bashrc"
+#   local port="${2:-${MIXED_PORT:-7890}}"
+
+#   [[ -f "$bashrc" ]] || { echo "❌ not found: $bashrc"; return 1; }
+
+#   # 备份
+#   local bak="${bashrc}.bak.$(date +%Y%m%d%H%M%S)"
+#   cp -a "$bashrc" "$bak" || { echo "❌ backup failed"; return 1; }
+
+#   # 1) 先清理：标记块 + 常见代理 export 行
+#   #    - 标记块：# >>> MH PROXY BEGIN ... # <<< MH PROXY END
+#   #    - 以及零散的 export http_proxy/HTTP_PROXY/NO_PROXY...（避免残留）
+#   perl -0777 -pe '
+#     s/\n?# >>> MH PROXY BEGIN\n.*?\n# <<< MH PROXY END\n?/\n/sg;
+#   ' -i "$bashrc"
+
+#   # 删除零散的代理行（只删我们关心的这些变量）
+#   sed -i \
+#     -e '/^[[:space:]]*export[[:space:]]\+\(http_proxy\|https_proxy\|all_proxy\|HTTP_PROXY\|HTTPS_PROXY\|ALL_PROXY\|NO_PROXY\|no_proxy\)=/d' \
+#     -e '/^[[:space:]]*\(http_proxy\|https_proxy\|all_proxy\|HTTP_PROXY\|HTTPS_PROXY\|ALL_PROXY\|NO_PROXY\|no_proxy\)=/d' \
+#     "$bashrc"
+
+#   case "$action" in
+#     on)
+#       cat >>"$bashrc" <<EOF
+
+# # >>> MH PROXY BEGIN
+# export http_proxy="http://127.0.0.1:${port}"
+# export https_proxy="http://127.0.0.1:${port}"
+# export all_proxy="socks5h://127.0.0.1:${port}"
+
+# export HTTP_PROXY="\$http_proxy"
+# export HTTPS_PROXY="\$https_proxy"
+# export ALL_PROXY="\$all_proxy"
+
+# export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+# export no_proxy="\$NO_PROXY"
+# # <<< MH PROXY END
+# EOF
+#       echo "✅ proxy_env on: wrote proxy to $bashrc (port=${port})"
+#       echo "   apply with: source ~/.bashrc"
+#       ;;
+#     off)
+#       echo "✅ proxy_env off: removed proxy lines from $bashrc"
+#       echo "   apply with: source ~/.bashrc"
+#       ;;
+#     *)
+#       echo "usage:"
+#       echo "  proxy_env on [port]   # write proxy exports into ~/.bashrc (default port=\${MIXED_PORT:-7890})"
+#       echo "  proxy_env off         # remove proxy exports from ~/.bashrc"
+#       echo "backup:"
+#       echo "  $bak"
+#       return 1
+#       ;;
+#   esac
+# }
+
+#=========================debug,上===============================
+
 main() {
+    proxy_on
+    # unset http_proxy https_proxy all_proxy HTTP_PROXY   # 停止一些用法，终止一些env
     if [[ -z "${1:-}"  ]]; then
-        ss -lntp | grep -E ':(9090|7890)'|| echo "❌ 未找到代理服务"
-        test_env
         tun_status
         proxy_env_status
         speedtest_now 1000
@@ -803,21 +946,18 @@ main() {
         exit 0
     fi
   case "${1:-}" in
-    add) 
+    add)
         cfg_add "$@";;
-    on|off)
-        on_off "$@";;
     start|end)
         start_end "$@";;
     select)
         select_one "$@";;
+    db)
+        debug_one "$@";;
     help|-h|--help) help ;;
     -l|--list|list) list_nodes ;;
-    tnu) shift; tnu "${1:-toggle}" ;;
-    test) net_test ;;
-    # *) pick_and_switch_by_keyword "${1:-}" ;;
+    tun) shift; tun "${1:-toggle}" ;;
     *) pick_switch_with_delay "${1:-}" 1200 ;;
   esac
 }
-
 main "$@"
