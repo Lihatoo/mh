@@ -11,7 +11,7 @@ mihomo: https://github.com/mihomo/mihomo
 sudo chmod +x mh   # 给予执行权限
 sudo setcap cap_net_admin,cap_net_raw+ep  /home/lht/bfile/mihomo/mihomo # 给予网络tun权限
 ```
-然后在任何终端都可以使用`mh`命令
+然后在任何终端都可以使用`mh`命令。
 
 # 使用
 
@@ -47,10 +47,39 @@ mh name # 搜索并列表选择节点
 ## 其他操作
 
 ```bash
-mh tun on/off # 开启/关闭tun
+mh tun on/off # 开启/关闭tun,可能需要sudo权限
+mh env # 输出当前 shell 可用的代理 export 片段
+mh mode rule/global/direct # 切换运行模式
+mh rules show/reset # 查看或重置内建基础规则
 mh -h # 帮助
 mh  # 快速预览信息
 mh db # 一些测试，debug专用
+sudo -E apt install ...#如果下载没有网络，则是环境没有导入 
+```
+
+如果要让当前 shell 立刻走代理，不能只执行 `mh`，因为它是子进程，没法反向修改你的父 shell 环境。要这样用：
+```bash
+eval "$(mh env)"
+```
+默认输出的是 `127.0.0.1:7897`，和常见 GUI 代理端口保持一致。也可以把 `mh env` 的输出写进 `~/.bashrc` / `~/.zshrc`。
+
+## 基础规则
+
+现在新建的 profile 默认走一套很简单的规则：
+
+- 局域网、本地回环直连
+- 其他流量走 `Final`
+- `Final` 默认选择 `Proxy`
+
+可以直接调整：
+
+```bash
+mh mode rule    # 规则模式
+mh mode global  # 全局代理
+mh mode direct  # 全局直连
+
+mh rules show   # 查看当前规则
+mh rules reset  # 重置成内建基础规则
 ```
 
 # 错误
@@ -62,11 +91,6 @@ mh db # 一些测试，debug专用
 `mh db`选择7 ,看看有几个dns！
 
 问我这里显示有两个dns，也就是说错误的ip解析可能来自另一个干扰的`tailscale0`（我这里是这个）
-
-
-
-
-
 
 
 

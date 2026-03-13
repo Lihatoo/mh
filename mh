@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 shopt -s nullglob
+
 MIHOMO_ROOT=/home/lht/bfile/mihomo
 MIHOMO_BIN=${MIHOMO_ROOT}/mihomo # 指向二进制文件
 PID_FILE=${MIHOMO_ROOT}/run.pid # 固定pid文件
 
 API_HOST="127.0.0.1"
 API_PORT="9090"
-MIXED_PORT="7890" #  默认main
-SOCK_PORT="7891"
+MIXED_PORT="7897" #  默认main
+SOCK_PORT="7898"
 API_BASE="http://${API_HOST}:${API_PORT}"
 API_SECRET="" # 这是密钥，用于验证；对应yaml中设置的secret字段，保持一致即可；如果不设置，默认空字符串，表示不验证
 
@@ -79,6 +80,20 @@ api_put() {
   fi
 }
 
+sync_global_group() {
+  local pjson
+  pjson="$(api_get "/proxies" 2>/dev/null)" || return 1
+
+  jq -e '.proxies["GLOBAL"]?.all? | index("Proxy") != null' >/dev/null <<<"$pjson" || return 0
+
+  local now
+  now="$(jq -r '.proxies["GLOBAL"].now // empty' <<<"$pjson")"
+  if [[ "$now" != "Proxy" ]]; then
+    api_put "/proxies/GLOBAL" '{"name":"Proxy"}' >/dev/null
+    info "Synced global selector [GLOBAL] -> [Proxy]"
+  fi
+}
+
 
 api_delay() {
   local name="$1"
@@ -115,6 +130,21 @@ need_root() {
     return 1
   fi
   return 0
+}
+
+has_mihomo_cap_net_admin() {
+  command -v getcap >/dev/null 2>&1 || return 1
+  getcap "$MIHOMO_BIN" 2>/dev/null | grep -q 'cap_net_admin'
+}
+
+disable_dns_fallback_geoip() {
+  local cfg="$1"
+  [[ -f "$cfg" ]] || return 1
+  yq -y -i '
+    .dns.enable = false |
+    .dns.fallback = [] |
+    .dns."fallback-filter" = null
+  ' "$cfg"
 }
 #===============测试小工具，上======================================
 
@@ -218,7 +248,7 @@ socks-port: ${SOCK_PORT}
 
 allow-lan: false
 bind-address: ${API_HOST}
-mode: global
+mode: rule
 log-level: info
 
 external-controller: ${API_HOST}:${API_PORT}
@@ -236,6 +266,25 @@ proxy-groups:
     type: select
     use:
       - ${name}
+  - name: Final
+    type: select
+    proxies:
+      - Proxy
+      - DIRECT
+
+rules:
+  - DOMAIN-SUFFIX,localhost,DIRECT
+  - DOMAIN-SUFFIX,local,DIRECT
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve
+  - IP-CIDR6,::1/128,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
+  - MATCH,Final
 YAML
 }
 
@@ -272,22 +321,92 @@ print_mihomo_status() {
   echo "✅ Now:   ${now}"
 }
 
+port_open_local() {
+  local port="$1"
+  ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "(:|\\.)${port}\$"
+}
+
+show_runtime_routing_status() {
+  local cfg pjson
+  cfg="$(api_get "/configs" 2>/dev/null)" || {
+    echo "Routing: API unavailable"
+    return 0
+  }
+  pjson="$(api_get "/proxies" 2>/dev/null)" || {
+    echo "Routing: /proxies unavailable"
+    return 0
+  }
+
+  local mode global_now final_now proxy_now
+  mode="$(jq -r '.mode // "-"' <<<"$cfg")"
+  global_now="$(jq -r '.proxies["GLOBAL"].now // empty' <<<"$pjson")"
+  final_now="$(jq -r '.proxies["Final"].now // empty' <<<"$pjson")"
+  proxy_now="$(jq -r '.proxies["Proxy"].now // empty' <<<"$pjson")"
+
+  echo "Mode: ${mode}"
+  [[ -n "$global_now" ]] && echo "GLOBAL -> ${global_now}"
+  [[ -n "$final_now" ]] && echo "Final  -> ${final_now}"
+  [[ -n "$proxy_now" ]] && echo "Proxy  -> ${proxy_now}"
+}
+
+extract_proxy_port() {
+  local value="${1:-}"
+  [[ -n "$value" ]] || return 1
+  sed -E 's#^[[:alpha:]][[:alnum:]+.-]*://[^:/]+:([0-9]+)/*$#\1#' <<<"$value"
+}
+
+proxy_env_status_line() {
+  local name="$1"
+  local value="$2"
+
+  if [[ -z "$value" ]]; then
+    echo "${name}: OFF"
+    return 0
+  fi
+
+  local port
+  port="$(extract_proxy_port "$value" 2>/dev/null || true)"
+  if [[ -n "$port" ]] && port_open_local "$port"; then
+    echo "${name}: ON  (${value}, port ${port} reachable)"
+  elif [[ -n "$port" ]]; then
+    echo "${name}: STALE  (${value}, port ${port} not listening)"
+  else
+    echo "${name}: ON  (${value})"
+  fi
+}
+
 
 
 start_end(){  # start/end name/none 文件
-    local start0Rend=$1
+    local start0Rend="${1:-}"
     local name_file=${2:-}
     local cfg=$MIHOMO_ROOT/$name_file
+    [[ -n "$start0Rend" ]] || die "usage: $0 start|end"
     if [[ "$start0Rend" == "start" ]]; then
         start_end "end" # 先停止当前
-        if [[ -d $cfg ]];then
-            # 进入的前提配置没有问题，可以直接运行
-            info "start mihomo with config=$cfg/config.yaml data=$cfg"
-            # 前台跑不方便，这里后台启动并记录 pid
-            test_port "$API_PORT" "$MIXED_PORT" "$SOCK_PORT"
-            "$MIHOMO_BIN" -d "$cfg" -f "$cfg/config.yaml" >"$cfg/mihomo.log" 2>&1 & # 每次启动情况记录
-            echo $! >"$PID_FILE" # 保存到定点位置
+        [[ -d "$cfg" ]] || die "profile not found: $cfg"
+        [[ -f "$cfg/config.yaml" ]] || die "missing config: $cfg/config.yaml"
+        local provider_name
+        provider_name="$(yq -r '."proxy-providers" | keys | .[0] // empty' "$cfg/config.yaml" 2>/dev/null || true)"
+        if [[ -n "$provider_name" ]]; then
+          yq -y -i "
+            .\"proxy-providers\".\"${provider_name}\".path = \"${cfg}/providers/${provider_name}.yaml\"
+          " "$cfg/config.yaml"
         fi
+        yq -y -i "
+          .[\"mixed-port\"] = ${MIXED_PORT} |
+          .[\"socks-port\"] = ${SOCK_PORT} |
+          .[\"external-controller\"] = \"${API_HOST}:${API_PORT}\"
+        " "$cfg/config.yaml"
+        if [[ "$(yq -r '.tun.enable // false' "$cfg/config.yaml" 2>/dev/null || echo false)" != "true" ]]; then
+          disable_dns_fallback_geoip "$cfg/config.yaml"
+        fi
+        # 进入的前提配置没有问题，可以直接运行
+        info "start mihomo with config=$cfg/config.yaml data=$cfg"
+        # 前台跑不方便，这里后台启动并记录 pid
+        test_port "$API_PORT" "$MIXED_PORT" "$SOCK_PORT"
+        "$MIHOMO_BIN" -d "$cfg" -f "$cfg/config.yaml" >"$cfg/mihomo.log" 2>&1 & # 每次启动情况记录
+        echo $! >"$PID_FILE" # 保存到定点位置
     elif [[ "$start0Rend" == "end" ]]; then
         if [[ -f "$PID_FILE" ]]; then # 存在就终止
             local pid
@@ -316,8 +435,8 @@ cfg_add() { # add name src
   if [[ "$1" == "add" ]]; then
     shift # 去掉 "add" 参数
   fi
-  local name="$1"
-  local src="$2"
+  local name="${1:-}"
+  local src="${2:-}"
   local cfg_root="${MIHOMO_ROOT}/${name}"
   [[ -n "$name" ]] || die "usage: $0 add <name> <url|file>"
   [[ -n "$src" ]]  || die "usage: $0 add <name> <url|file>"
@@ -356,7 +475,7 @@ get_group_nodes_json() {
 
 help() {
   cat <<EOF
-✅ 复制粘贴到你的 shell 启动文件（见下方“该改哪个文件”）：
+✅ 复制粘贴到你的 shell 启动文件（见下方“该改哪个文件”），或直接执行 mh env：
 
 # ====== MIHOMO PROXY ENV BEGIN ======
 export http_proxy="http://127.0.0.1:${MIXED_PORT}"
@@ -427,9 +546,33 @@ Commands:
   end
       停止当前 mihomo（通过 ${PID_FILE} 记录的 pid）
 
+  env
+      输出代理环境变量 export 片段
+      用法示例：
+        eval "\$(mh env)"
+
+  mode [rule|global|direct]
+      切换当前 profile 的运行模式，并重启
+      - rule   使用内建基础规则
+      - global 全部走代理
+      - direct 全部直连
+
+  rules [show|reset]
+      查看或重置当前 profile 的基础规则
+      - show  显示当前规则
+      - reset 写回一套最简规则，并切回 rule 模式
+
+  doctor
+      输出当前 mh/mihomo 的诊断信息
+      - capability
+      - 端口监听
+      - TUN/模式/代理环境
+      - API / 路由 / DNS
+      - 最近日志
+
   tun [on|off|toggle]
       开关 TUN（会写入当前 profile 的 config.yaml 并重启）
-      - 开启 TUN 通常需要 sudo/root 或给 mihomo 加能力：
+      - 开启 TUN 通常需要 sudo/root，或给 mihomo 加能力：
           sudo setcap cap_net_admin,cap_net_raw+ep "<mihomo_bin>"
 
   -l | --list | list
@@ -465,6 +608,21 @@ Examples:
   # 停止 mihomo
   mh end
 
+  # 输出代理环境变量
+  mh env
+
+  # 切换模式
+  mh mode rule
+  mh mode global
+  mh mode direct
+
+  # 查看/重置基础规则
+  mh rules show
+  mh rules reset
+
+  # 一键诊断
+  mh doctor
+
   # 查看节点列表
   mh -l
 
@@ -479,6 +637,7 @@ Examples:
 Notes:
   - API 不通时，很多功能会失败：确保 mihomo 正在运行且 external-controller 为 ${API_HOST}:${API_PORT}
   - 如果刚启动就查询失败，wait_api 会稍等 mihomo API 就绪（避免 race）
+  - `mh` 是子进程，不能直接修改你当前 shell 的代理环境；需要 `eval "\$(mh env)"` 或写入 rc 文件
 EOF
 }
 
@@ -520,6 +679,7 @@ select_one(){ # select name
     echo "$name" > "${MIHOMO_ROOT}/current.profile"
     start_end "start" "$name"
     wait_api 5 || warn "mihomo API not ready yet"
+    sync_global_group || warn "failed to sync GLOBAL -> Proxy"
     speedtest_now 1000
 
 }
@@ -529,6 +689,97 @@ select_one(){ # select name
 current_profile() {
   [[ -f "${MIHOMO_ROOT}/current.profile" ]] || return 1
   cat "${MIHOMO_ROOT}/current.profile"
+}
+
+current_profile_cfg() {
+  local prof
+  prof="$(current_profile)" || return 1
+  printf '%s/%s/config.yaml\n' "$MIHOMO_ROOT" "$prof"
+}
+
+reset_basic_rules() {
+  local cfg="$1"
+  [[ -f "$cfg" ]] || return 1
+
+  local provider_name
+  provider_name="$(yq -r '."proxy-providers" | keys | .[0] // empty' "$cfg" 2>/dev/null)"
+  [[ -n "$provider_name" ]] || { warn "cannot detect proxy-provider name from $cfg"; return 1; }
+
+  yq -y -i "
+    .mode = \"rule\" |
+    .[\"proxy-groups\"] = [
+      {\"name\":\"Proxy\",\"type\":\"select\",\"use\":[\"${provider_name}\"]},
+      {\"name\":\"Final\",\"type\":\"select\",\"proxies\":[\"Proxy\",\"DIRECT\"]}
+    ] |
+    .rules = [
+      \"DOMAIN-SUFFIX,localhost,DIRECT\",
+      \"DOMAIN-SUFFIX,local,DIRECT\",
+      \"IP-CIDR,127.0.0.0/8,DIRECT,no-resolve\",
+      \"IP-CIDR,10.0.0.0/8,DIRECT,no-resolve\",
+      \"IP-CIDR,172.16.0.0/12,DIRECT,no-resolve\",
+      \"IP-CIDR,192.168.0.0/16,DIRECT,no-resolve\",
+      \"IP-CIDR,100.64.0.0/10,DIRECT,no-resolve\",
+      \"IP-CIDR,224.0.0.0/4,DIRECT,no-resolve\",
+      \"IP-CIDR6,::1/128,DIRECT,no-resolve\",
+      \"IP-CIDR6,fc00::/7,DIRECT,no-resolve\",
+      \"IP-CIDR6,fe80::/10,DIRECT,no-resolve\",
+      \"MATCH,Final\"
+    ]
+  " "$cfg"
+}
+
+mode_set() {
+  local next_mode="${1:-}"
+  case "$next_mode" in
+    rule|global|direct) ;;
+    *) die "usage: $0 mode rule|global|direct" ;;
+  esac
+
+  local prof cfg
+  prof="$(current_profile)" || die "no current profile"
+  cfg="${MIHOMO_ROOT}/${prof}/config.yaml"
+  [[ -f "$cfg" ]] || die "missing config: $cfg"
+
+  if [[ "$next_mode" == "rule" ]] && ! yq -e '.rules | length > 0' "$cfg" >/dev/null 2>&1; then
+    info "No rules found in profile=${prof}, applying basic rules first..."
+    reset_basic_rules "$cfg" || die "failed to initialize basic rules"
+  fi
+
+  yq -y -i ".mode = \"${next_mode}\"" "$cfg"
+  info "Mode set to ${next_mode} (profile=${prof}), restarting..."
+  start_end end
+  start_end start "$prof"
+  wait_api 5 || warn "mihomo API not ready"
+  if [[ "$next_mode" == "global" ]]; then
+    sync_global_group || warn "failed to sync GLOBAL -> Proxy"
+  fi
+  print_mihomo_status || true
+}
+
+rules_cmd() {
+  local action="${1:-show}"
+  local cfg prof
+  prof="$(current_profile)" || die "no current profile"
+  cfg="${MIHOMO_ROOT}/${prof}/config.yaml"
+  [[ -f "$cfg" ]] || die "missing config: $cfg"
+
+  case "$action" in
+    show)
+      echo "Rules (profile=${prof}):"
+      yq -r '.rules[]?' "$cfg"
+      ;;
+    reset)
+      reset_basic_rules "$cfg" || die "failed to reset basic rules"
+      info "Basic rules reset (profile=${prof}), restarting..."
+      start_end end
+      start_end start "$prof"
+      wait_api 5 || warn "mihomo API not ready"
+      print_mihomo_status || true
+      ;;
+    *)
+      die "usage: $0 rules show|reset"
+      ;;
+  esac
 }
 
 tun() {
@@ -550,8 +801,9 @@ tun() {
     toggle) [[ "$cur" == "true" ]] && next=false || next=true ;;
     *) warn "usage: mh tun on|off|toggle"; return 1 ;;
   esac
-  if [[ "$next" == "true" ]]; then  # 只有“要开启 tun”才提示/要求 sudo
-    need_root "sudo -E \"$0\" tun ${action}" || return 1
+  if [[ "$next" == "true" && "${EUID:-$(id -u)}" -ne 0 ]] && ! has_mihomo_cap_net_admin; then
+    warn "开启 TUN 通常需要 root，或提前给 mihomo 设置 cap_net_admin/cap_net_raw"
+    warn "继续尝试启动；若失败，请执行：sudo setcap cap_net_admin,cap_net_raw+ep \"$MIHOMO_BIN\""
   fi
   yq -y -i "
     .tun.enable = ${next} |
@@ -567,13 +819,19 @@ tun() {
     .dns.listen = (.dns.listen // \"127.0.0.1:1053\") |
     .dns[\"enhanced-mode\"] = \"redir-host\" |
     .dns.nameserver = (.dns.nameserver // [\"223.5.5.5\",\"119.29.29.29\"]) |
-    .dns.fallback = (.dns.fallback // [\"1.1.1.1\",\"8.8.8.8\"])
+    .dns.fallback = (.dns.fallback // [\"1.1.1.1\",\"8.8.8.8\"]) |
+    .dns[\"fallback-filter\"].geoip = false
   " "$cfg"
+
+  if [[ "$next" != "true" ]]; then
+    disable_dns_fallback_geoip "$cfg"
+  fi
 
   info "TUN set to ${next} (profile=${prof}), restarting..."
   start_end end
   start_end start "$prof"
   wait_api 5 || warn "mihomo API not ready"
+  sync_global_group || warn "failed to sync GLOBAL -> Proxy"
   print_mihomo_status 1200 || true
 }
 
@@ -749,11 +1007,24 @@ tun_status() {
 
 
 proxy_env_status() {
-  if [[ -n "${HTTP_PROXY:-}" || -n "${HTTPS_PROXY:-}" ]]; then
-    echo "Proxy ENV: ON  (HTTP_PROXY=${HTTP_PROXY:-<unset>}  HTTPS_PROXY=${HTTPS_PROXY:-<unset>})"
-  else
-    echo "Proxy ENV: OFF"
-  fi
+  proxy_env_status_line "HTTP_PROXY" "${HTTP_PROXY:-}"
+  proxy_env_status_line "HTTPS_PROXY" "${HTTPS_PROXY:-}"
+  proxy_env_status_line "ALL_PROXY" "${ALL_PROXY:-}"
+}
+
+show_proxy_exports() {
+  cat <<EOF
+export http_proxy="http://127.0.0.1:${MIXED_PORT}"
+export https_proxy="http://127.0.0.1:${MIXED_PORT}"
+export all_proxy="socks5h://127.0.0.1:${MIXED_PORT}"
+
+export HTTP_PROXY="\$http_proxy"
+export HTTPS_PROXY="\$https_proxy"
+export ALL_PROXY="\$all_proxy"
+
+export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+export no_proxy="\$NO_PROXY"
+EOF
 }
 
 net_test() {
@@ -819,7 +1090,7 @@ debug_one() {
   shift
 
   local -a debug_code=()
-  debug_code[1]="ss -lntp | grep -E ':(9090|9091|7890|7891)'|| echo \"❌ 未找到代理服务\""
+  debug_code[1]="ss -lntp | grep -E ':(9090|9091|7897|7898|7890|7891)'|| echo \"❌ 未找到代理服务\""
   debug_code[2]="ps -fp \${1:-} -o pid,ppid,cmd"
   debug_code[3]="net_test"
   debug_code[4]="net_test_double"
@@ -828,7 +1099,7 @@ debug_one() {
   debug_code[7]="resolvectl status 2>/dev/null | sed -n '1,120p' || cat /etc/resolv.conf"
 
   local -a debug_desc=()
-  debug_desc[1]="检查 9090/9091/7890 端口监听:"
+  debug_desc[1]="检查 9090/9091/7897/7898 端口监听:"
   debug_desc[2]="查看指定 PID 的进程信息:"
   debug_desc[3]="测试一下网络(仅proxy)"
   debug_desc[4]="测试一下网络(直连+proxy)"
@@ -854,6 +1125,58 @@ debug_one() {
 
   echo "invalid index: $idx"
   return 1
+}
+
+doctor() {
+  local prof cfg
+  prof="$(current_profile 2>/dev/null || true)"
+  cfg=""
+  [[ -n "$prof" ]] && cfg="${MIHOMO_ROOT}/${prof}/config.yaml"
+
+  echo "== mh doctor =="
+  echo "root: ${MIHOMO_ROOT}"
+  echo "bin:  ${MIHOMO_BIN}"
+  echo "pid:  ${PID_FILE}"
+  [[ -n "$prof" ]] && echo "profile: ${prof}" || echo "profile: <none>"
+  [[ -n "$cfg" ]] && echo "config: ${cfg}"
+  echo
+
+  echo "== capability =="
+  if command -v getcap >/dev/null 2>&1; then
+    getcap "$MIHOMO_BIN" 2>/dev/null || true
+  else
+    echo "getcap not found"
+  fi
+  echo
+
+  echo "== ports =="
+  ss -lnt 2>/dev/null | grep -E ":(9090|7897|7898|1053)\\b" || echo "no mh ports listening"
+  echo
+
+  echo "== runtime =="
+  tun_status
+  show_runtime_routing_status
+  proxy_env_status
+  echo
+
+  echo "== api =="
+  api_get "/configs" 2>/dev/null | jq -r '{mode, "mixed-port": ."mixed-port", "socks-port": ."socks-port", "external-controller": ."external-controller"}' 2>/dev/null || echo "api unavailable"
+  echo
+
+  echo "== route =="
+  ip route show default 2>/dev/null || true
+  echo
+
+  echo "== dns =="
+  resolvectl status 2>/dev/null | sed -n '1,120p' || cat /etc/resolv.conf
+  echo
+
+  echo "== log tail =="
+  if [[ -n "$prof" && -f "${MIHOMO_ROOT}/${prof}/mihomo.log" ]]; then
+    tail -n 40 "${MIHOMO_ROOT}/${prof}/mihomo.log"
+  else
+    echo "no log file"
+  fi
 }
 
 proxy_on() {
@@ -936,24 +1259,34 @@ proxy_off() {
 #=========================debug,上===============================
 
 main() {
-    proxy_on
-    # unset http_proxy https_proxy all_proxy HTTP_PROXY   # 停止一些用法，终止一些env
     if [[ -z "${1:-}"  ]]; then
         tun_status
+        show_runtime_routing_status
         proxy_env_status
-        speedtest_now 1000
+        speedtest_now 1000 || true
         # print_mihomo_status
         exit 0
     fi
   case "${1:-}" in
     add)
         cfg_add "$@";;
-    start|end)
+    start)
+        [[ -n "${2:-}" ]] || die "usage: $0 start <name>"
+        select_one "select" "${2}";;
+    end)
         start_end "$@";;
     select)
         select_one "$@";;
     db)
         debug_one "$@";;
+    doctor)
+        doctor ;;
+    env)
+        show_proxy_exports ;;
+    mode)
+        shift; mode_set "${1:-}" ;;
+    rules)
+        shift; rules_cmd "${1:-show}" ;;
     help|-h|--help) help ;;
     -l|--list|list) list_nodes ;;
     tun) shift; tun "${1:-toggle}" ;;
