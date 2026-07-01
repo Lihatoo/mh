@@ -3,11 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MH_BIN="${ROOT_DIR}/mh"
-PROFILE="${1:-tnt}"
+PROFILE="${1:-demo}"
 TIMEOUT="${TIMEOUT:-10}"
 API_PORT="${API_PORT:-9090}"
-MIXED_PORT="${MIXED_PORT:-7897}"
-SOCKS_PORT="${SOCKS_PORT:-7898}"
+MIXED_PORT="${MIXED_PORT:-7890}"
+SOCKS_PORT="${SOCKS_PORT:-7891}"
 OLD_PROXY_PORT="${OLD_PROXY_PORT:-}"
 RUN_PID_FILE="${ROOT_DIR}/run.pid"
 LOG_FILE="${ROOT_DIR}/${PROFILE}/mihomo.log"
@@ -90,7 +90,7 @@ print_env_snapshot() {
 
 print_port_snapshot() {
   print_section "Port Snapshot"
-  ss -lnt | grep -E ":(7897|7898|9090)\\b" || true
+  ss -lnt | grep -E ":(7890|7891|9090)\\b" || true
 }
 
 print_pid_snapshot() {

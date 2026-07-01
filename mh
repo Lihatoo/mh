@@ -2,14 +2,30 @@
 set -euo pipefail
 shopt -s nullglob
 
-MIHOMO_ROOT=/home/lht/bfile/mihomo
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+resolve_mihomo_root() {
+  if [[ -n "${MIHOMO_ROOT:-}" ]]; then
+    printf "%s\n" "$MIHOMO_ROOT"
+  elif [[ -x "${PWD}/mihomo" ]]; then
+    printf "%s\n" "$PWD"
+  elif [[ "$SCRIPT_DIR" != "/usr/local/bin" && -x "${SCRIPT_DIR}/mihomo" ]]; then
+    printf "%s\n" "$SCRIPT_DIR"
+  else
+    echo "mh: cannot locate mihomo root; cd into the project dir or set MIHOMO_ROOT=/path/to/mihomo" >&2
+    exit 1
+  fi
+}
+
+MIHOMO_ROOT="$(resolve_mihomo_root)"
 MIHOMO_BIN=${MIHOMO_ROOT}/mihomo # 指向二进制文件
 PID_FILE=${MIHOMO_ROOT}/run.pid # 固定pid文件
+THEME_FILE=${MIHOMO_ROOT}/theme.current
 
 API_HOST="127.0.0.1"
 API_PORT="9090"
-MIXED_PORT="7897" #  默认main
-SOCK_PORT="7898"
+MIXED_PORT="7890" #  默认main
+SOCK_PORT="7891"
 API_BASE="http://${API_HOST}:${API_PORT}"
 API_SECRET="" # 这是密钥，用于验证；对应yaml中设置的secret字段，保持一致即可；如果不设置，默认空字符串，表示不验证
 
@@ -24,10 +40,47 @@ PY
 
 
 #===============测试小工具，下======================================
+theme_current() {
+  local theme="basic"
+  if [[ -f "$THEME_FILE" ]]; then
+    theme="$(tr -d '[:space:]' < "$THEME_FILE")"
+  fi
+  case "$theme" in
+    basic|ganyu|kaomoji|minimal) printf '%s\n' "$theme" ;;
+    *) printf 'basic\n' ;;
+  esac
+}
+
+theme_prefix() {
+  local level="$1"
+  case "$(theme_current):$level" in
+    basic:DEBUG) printf '[debug] ' ;;
+    basic:INFO) printf '[info] ' ;;
+    basic:WARN) printf '[warn] ' ;;
+    basic:ERROR) printf '[error] ' ;;
+    basic:OK) printf '[ok] ' ;;
+
+    ganyu:DEBUG) printf '(甘雨观察中) ' ;;
+    ganyu:INFO) printf '❄️ 甘雨小秘书：' ;;
+    ganyu:WARN) printf '🍧 甘雨提醒：' ;;
+    ganyu:ERROR) printf '(甘雨皱眉) ' ;;
+    ganyu:OK) printf '🍡 甘雨点头：' ;;
+
+    kaomoji:DEBUG) printf '(눈_눈) ' ;;
+    kaomoji:INFO) printf '(｡･ω･｡) ' ;;
+    kaomoji:WARN) printf '(；´д｀)ゞ ' ;;
+    kaomoji:ERROR) printf '(╯°□°)╯ ' ;;
+    kaomoji:OK) printf '(๑•̀ㅂ•́)و✧ ' ;;
+
+    minimal:*) printf '' ;;
+    *) printf '' ;;
+  esac
+}
+
 log() {
     local level=$1
     shift
-    echo "[$(date +%H:%M:%S)] [$level] $*"
+    echo "[$(date +%H:%M:%S)] [$level] $(theme_prefix "$level")$*"
 }
 debug() { [[ "${DEBUG:-0}" == "1" ]] && log "DEBUG" "$@"; }
 info()  { log "INFO" "$@"; }
@@ -80,6 +133,16 @@ api_put() {
   fi
 }
 
+api_put_empty() {
+  local path="$1"
+  if [[ -n "${API_SECRET}" ]]; then
+    curl -fsS --noproxy '*' -X PUT \
+      -H "Authorization: Bearer ${API_SECRET}" "${API_BASE}${path}"
+  else
+    curl -fsS --noproxy '*' -X PUT "${API_BASE}${path}"
+  fi
+}
+
 sync_global_group() {
   local pjson
   pjson="$(api_get "/proxies" 2>/dev/null)" || return 1
@@ -117,19 +180,6 @@ switch_group_node() {
 
   api_put "/proxies/${enc_group}" "$(jq -nc --arg name "$node" '{name:$name}')" >/dev/null
   info "Switched group [$group] -> [$node]"
-}
-
-need_root() {
-  # 用法：need_root "sudo -E $0 tun on"
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    warn "此操作需要 sudo/root 权限"
-    warn "请用 sudo 运行："
-    warn "  $1"
-    warn "或给 mihomo 二进制加能力（不必整进程 root）："
-    warn "  sudo setcap cap_net_admin,cap_net_raw+ep \"$MIHOMO_BIN\""
-    return 1
-  fi
-  return 0
 }
 
 has_mihomo_cap_net_admin() {
@@ -249,7 +299,7 @@ socks-port: ${SOCK_PORT}
 allow-lan: false
 bind-address: ${API_HOST}
 mode: rule
-log-level: info
+log-level: error
 
 external-controller: ${API_HOST}:${API_PORT}
 secret: ""
@@ -258,7 +308,7 @@ proxy-providers:
   ${name}:
     type: http
     url: "${url}"
-    interval: 3600
+    interval: 86400
     path: "${MIHOMO_ROOT}/$name/providers/$name.yaml"
 
 proxy-groups:
@@ -288,6 +338,65 @@ rules:
 YAML
 }
 
+ensure_profile_config() {
+  local profile_dir="$1"
+  local cfg="${profile_dir}/config.yaml"
+  [[ -d "$profile_dir" ]] || die "profile not found: $profile_dir"
+  [[ -f "$cfg" ]] || die "missing config: $cfg"
+
+  mkdir -p "${profile_dir}/providers"
+
+  local -a providers
+  mapfile -t providers < <(yq -r '."proxy-providers" | keys[]?' "$cfg" 2>/dev/null)
+  (( ${#providers[@]} > 0 )) || die "missing proxy-providers in $cfg"
+
+  local provider ptype purl ppath
+  for provider in "${providers[@]}"; do
+    ptype="$(yq -r --arg p "$provider" '."proxy-providers"[$p].type // ""' "$cfg")"
+    case "$ptype" in
+      http)
+        purl="$(yq -r --arg p "$provider" '."proxy-providers"[$p].url // ""' "$cfg")"
+        [[ -n "$purl" ]] || die "provider [$provider] is http but url is empty"
+        yq -y -i --arg p "$provider" --arg path "${profile_dir}/providers/${provider}.yaml" '."proxy-providers"[$p].path = $path | ."proxy-providers"[$p].interval = 86400' "$cfg"
+        ;;
+      file)
+        ppath="$(yq -r --arg p "$provider" '."proxy-providers"[$p].path // ""' "$cfg")"
+        [[ -n "$ppath" ]] || ppath="${profile_dir}/providers/${provider}.yaml"
+        yq -y -i --arg p "$provider" --arg path "$ppath" '."proxy-providers"[$p].path = $path' "$cfg"
+        [[ -f "$ppath" ]] || die "provider [$provider] file not found: $ppath"
+        ;;
+      *)
+        die "provider [$provider] has unsupported or empty type: ${ptype:-<empty>}"
+        ;;
+    esac
+  done
+
+  local mode
+  mode="$(yq -r '.mode // ""' "$cfg" 2>/dev/null)"
+  case "$mode" in
+    rule|global|direct) ;;
+    "") mode="rule" ;;
+    *) warn "invalid mode [$mode], reset to rule"; mode="rule" ;;
+  esac
+
+  yq -y -i "
+    .mode = \"${mode}\" |
+    .[\"mixed-port\"] = ${MIXED_PORT} |
+    .[\"socks-port\"] = ${SOCK_PORT} |
+    .[\"external-controller\"] = \"${API_HOST}:${API_PORT}\" |
+    .secret = (.secret // \"\") |
+    .[\"log-level\"] = \"error\" |
+    .[\"allow-lan\"] = (.[\"allow-lan\"] // false) |
+    .[\"bind-address\"] = \"${API_HOST}\"
+  " "$cfg"
+
+  if ! yq -e '([."proxy-groups"[]?.name] | index("Proxy") != null and index("Final") != null) and (.rules | type == "array" and length > 0)' "$cfg" >/dev/null 2>&1; then
+    warn "proxy-groups or rules missing, applying basic rule config"
+    reset_basic_rules "$cfg" || die "failed to initialize basic rules"
+  fi
+
+  yq -e '.mode as $mode | ($mode == "rule" or $mode == "global" or $mode == "direct") and (."mixed-port" | type == "number") and (."socks-port" | type == "number") and (."proxy-providers" | type == "object" and length > 0) and (."proxy-groups" | type == "array" and length > 0) and (.rules | type == "array" and length > 0)' "$cfg" >/dev/null || die "invalid mihomo config after normalization: $cfg"
+}
 #=====================mihomo配置，上====================================
 print_mihomo_status() {
   local cfg pjson
@@ -386,18 +495,7 @@ start_end(){  # start/end name/none 文件
         start_end "end" # 先停止当前
         [[ -d "$cfg" ]] || die "profile not found: $cfg"
         [[ -f "$cfg/config.yaml" ]] || die "missing config: $cfg/config.yaml"
-        local provider_name
-        provider_name="$(yq -r '."proxy-providers" | keys | .[0] // empty' "$cfg/config.yaml" 2>/dev/null || true)"
-        if [[ -n "$provider_name" ]]; then
-          yq -y -i "
-            .\"proxy-providers\".\"${provider_name}\".path = \"${cfg}/providers/${provider_name}.yaml\"
-          " "$cfg/config.yaml"
-        fi
-        yq -y -i "
-          .[\"mixed-port\"] = ${MIXED_PORT} |
-          .[\"socks-port\"] = ${SOCK_PORT} |
-          .[\"external-controller\"] = \"${API_HOST}:${API_PORT}\"
-        " "$cfg/config.yaml"
+        ensure_profile_config "$cfg"
         if [[ "$(yq -r '.tun.enable // false' "$cfg/config.yaml" 2>/dev/null || echo false)" != "true" ]]; then
           disable_dns_fallback_geoip "$cfg/config.yaml"
         fi
@@ -413,7 +511,6 @@ start_end(){  # start/end name/none 文件
             pid="$(cat "$PID_FILE" || true)"
             if [[ -n "${pid}" ]] && kill "$pid" 2>/dev/null; then
               info "stop process  pid=$pid"
-              kill "$pid" 2>/dev/null || true
               # 等一下让它退出
               for _ in {1..20}; do
                   kill -0 "$pid" 2>/dev/null || break
@@ -443,8 +540,7 @@ cfg_add() { # add name src
   if [[ -d "$cfg_root" ]]; then
     die "profile exists: $cfg_root ,请换一个名称"
   fi
-  mkdir -p "$cfg_root"
-  mkdir -p "$cfg_root/providers"  # 
+  mkdir -p "$cfg_root/providers"
   write_cfg "$name" "$src" 
   if [[ -f "$src" ]]; then #file: 直接复制,不用下载了
     info "copy file -> ${cfg_root}/providers/$name.yaml"
@@ -456,6 +552,8 @@ cfg_add() { # add name src
     " "$cfg_root/config.yaml"
     info "saved: ${cfg_root}/providers/$name.yaml" # 有了文件，等会挂载
   fi
+    ensure_bypass_list "$cfg_root"
+    reset_basic_rules "$cfg_root/config.yaml"
     # 启动这个配置
     select_one "select" "$name" # 启动这个新的节点
     print_mihomo_status 1000
@@ -473,171 +571,146 @@ get_group_nodes_json() {
 }
 
 
+provider_http_list() {
+  local cfg="$1"
+  yq -r '."proxy-providers" | to_entries[]? | select(.value.type == "http") | .key' "$cfg"
+}
+
+provider_in_list() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+update_one_provider() {
+  local provider="$1"
+  local enc_provider
+  enc_provider="$(urlenc "$provider")"
+  api_put_empty "/providers/proxies/${enc_provider}" >/dev/null
+  info "updated provider: $provider"
+}
+
+update_providers_cmd() {
+  local target="${1:-}"
+  local prof cfg_dir cfg
+  prof="$(current_profile)" || die "no current profile"
+  cfg_dir="${MIHOMO_ROOT}/${prof}"
+  cfg="${cfg_dir}/config.yaml"
+  ensure_profile_config "$cfg_dir"
+
+  local -a providers selected
+  mapfile -t providers < <(provider_http_list "$cfg")
+  (( ${#providers[@]} > 0 )) || die "no http proxy-providers in profile=${prof}"
+
+  if ! wait_api 3; then
+    info "mihomo API not ready, starting current profile=${prof} first..."
+    start_end start "$prof"
+    wait_api 5 || die "mihomo API not ready after start"
+  fi
+
+  case "$target" in
+    "" )
+      echo "📦 HTTP providers (profile=${prof}):"
+      echo "  0) ALL"
+      local i pick
+      for i in "${!providers[@]}"; do
+        printf "  %d) %s\n" "$((i+1))" "${providers[$i]}"
+      done
+      while true; do
+        read -r -p "👉 请输入序号 (0-${#providers[@]}): " pick
+        [[ "$pick" =~ ^[0-9]+$ ]] || { echo "❌ 请输入数字"; continue; }
+        (( pick>=0 && pick<=${#providers[@]} )) || { echo "❌ 超出范围"; continue; }
+        break
+      done
+      if (( pick == 0 )); then
+        selected=("${providers[@]}")
+      else
+        selected=("${providers[$((pick-1))]}")
+      fi
+      ;;
+    all|ALL)
+      selected=("${providers[@]}")
+      ;;
+    *)
+      provider_in_list "$target" "${providers[@]}" || die "provider not found or not http: $target"
+      selected=("$target")
+      ;;
+  esac
+
+  local provider
+  for provider in "${selected[@]}"; do
+    update_one_provider "$provider"
+  done
+}
+
+theme_cmd() {
+  local action="${1:-show}"
+  case "$action" in
+    show|current)
+      echo "current theme: $(theme_current)"
+      echo "available: basic ganyu kaomoji minimal"
+      ;;
+    list)
+      cat <<THEMES
+basic    - 稳定基础版，ASCII 前缀，最不挑终端
+ganyu    - 原神甘雨风格，少量 emoji + 轻提示
+kaomoji  - 颜文字版，适合 emoji 显示不完整的终端
+minimal  - 极简版，不加额外表情
+THEMES
+      ;;
+    basic|ganyu|kaomoji|minimal)
+      printf '%s\n' "$action" > "$THEME_FILE"
+      info "theme set to ${action}"
+      ;;
+    *)
+      die "usage: $0 theme [show|list|basic|ganyu|kaomoji|minimal]"
+      ;;
+  esac
+}
+
 help() {
   cat <<EOF
-✅ 复制粘贴到你的 shell 启动文件（见下方“该改哪个文件”），或直接执行 mh env：
-
-# ====== MIHOMO PROXY ENV BEGIN ======
-export http_proxy="http://127.0.0.1:${MIXED_PORT}"
-export https_proxy="http://127.0.0.1:${MIXED_PORT}"
-export all_proxy="socks5h://127.0.0.1:${MIXED_PORT}"
-
-export HTTP_PROXY="\$http_proxy"
-export HTTPS_PROXY="\$https_proxy"
-export ALL_PROXY="\$all_proxy"
-
-# 避免本地/内网/控制端口走代理（按需加减）
-export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-export no_proxy="\$NO_PROXY"
-# ====== MIHOMO PROXY ENV END ======
-
-应用方法（改完文件后执行其一）：
-  source ~/.bashrc
-  source ~/.zshrc
-  exec \$SHELL -l
-
--------------------------------------------------------------------------------
-该改哪个文件？（尽量准确 + 兜底）
-
-1) 先看你当前是什么 shell：
-  echo "\$SHELL"
-  ps -p \$\$ -o comm=
-
-2) 尝试自动判断“这次会读哪个 rc 文件”（不保证 100% 准确，但很实用）：
-  # bash：看看是不是 login shell
-  shopt -q login_shell && echo "login shell" || echo "non-login shell"
-
-  # zsh：看看 ZDOTDIR / 以及默认读 ~/.zshrc
-  echo "ZDOTDIR=\${ZDOTDIR:-<unset>}"
-
-3) 常见规则（按你当前情况选一个文件写入）：
-  - bash + 交互式非登录 shell（多数终端 tab）：~/.bashrc
-  - bash + 登录 shell（ssh 登录 / 有些终端配置）：~/.bash_profile 或 ~/.profile
-  - zsh（mac 常见）：~/.zshrc
-  - 如果你不确定：
-      a) bash：同时写 ~/.bashrc 和 ~/.bash_profile（bash_profile 里最好加一行：[[ -f ~/.bashrc ]] && source ~/.bashrc）
-      b) zsh：写 ~/.zshrc
-
-验证是否生效（新开终端或 source 后）：
-  echo \$http_proxy
-  env | grep -iE 'http_proxy|https_proxy|all_proxy|no_proxy'
-
--------------------------------------------------------------------------------
-
 Usage:
   mh [command] [args...]
 
 Commands:
-  add <name> <url|file>
-      新建一个 profile 目录：${MIHOMO_ROOT}/<name>/
-      - 生成 config.yaml
-      - 把订阅作为 proxy-provider
-      - <url>  在线订阅（type=http）
-      - <file> 本地文件（type=file，会自动删 url/interval）
+  add <name> <url|file>     新建 profile
+  select [name]             切换/启动 profile，不带 name 时交互选择
+  start <name>              等价于 select <name>
+  end                       停止当前 mihomo
+  env                       输出代理 export，常用：eval "\$(mh env)"
+  theme [name]              查看或切换输出主题
+  sysproxy [on|off|status]  开关 GNOME 系统代理
+  update [all|provider]     更新当前 profile 的 HTTP provider
+  mode rule|global|direct   切换运行模式并重启
+  rules show|reset          查看或重置基础规则
+  tun [on|off|toggle]       开关 TUN
+  list | -l | --list [kw]   列出节点并可输入序号切换
+  doctor                    输出诊断信息
+  db                        调试菜单
+  help | -h | --help        显示帮助
 
-  select [name]
-      切换/启动某个 profile
-      - 不带 name：列出目录，输入序号选择
-      - 带 name：直接启动 ${MIHOMO_ROOT}/<name>/
-
-  start <name>
-      直接启动指定 profile（等价于：select <name>）
-
-  end
-      停止当前 mihomo（通过 ${PID_FILE} 记录的 pid）
-
-  env
-      输出代理环境变量 export 片段
-      用法示例：
-        eval "\$(mh env)"
-
-  mode [rule|global|direct]
-      切换当前 profile 的运行模式，并重启
-      - rule   使用内建基础规则
-      - global 全部走代理
-      - direct 全部直连
-
-  rules [show|reset]
-      查看或重置当前 profile 的基础规则
-      - show  显示当前规则
-      - reset 写回一套最简规则，并切回 rule 模式
-
-  doctor
-      输出当前 mh/mihomo 的诊断信息
-      - capability
-      - 端口监听
-      - TUN/模式/代理环境
-      - API / 路由 / DNS
-      - 最近日志
-
-  tun [on|off|toggle]
-      开关 TUN（会写入当前 profile 的 config.yaml 并重启）
-      - 开启 TUN 通常需要 sudo/root，或给 mihomo 加能力：
-          sudo setcap cap_net_admin,cap_net_raw+ep "<mihomo_bin>"
-
-  -l | --list | list
-      列出主组(优先 Proxy)的所有节点，并标记当前节点
-
-  <keyword>
-      模糊搜索节点名称并测速排序后让你选择切换
-      例如：
-        mh 美国
-        mh 香港
-        mh JP
-        mh SG
-
-No-args (默认行为):
-  直接显示：
-    - TUN 状态
-    - 当前环境是否存在 HTTP_PROXY/HTTPS_PROXY
-    - 当前节点延迟测速（通过 mihomo API）
-
--------------------------------------------------------------------------------
+Default:
+  mh                        显示 TUN/路由/代理环境/当前节点延迟
+  mh <keyword>              搜索节点并按延迟排序选择切换
 
 Examples:
-  # 添加订阅（在线）
-  mh add tnt "https://example.com/sub.yaml"
-
-  # 添加订阅（本地文件）
+  mh add demo "https://example.com/sub.yaml"
   mh add local "/path/to/sub.yaml"
-
-  # 启动/切换 profile
   mh select
-  mh select tnt
-
-  # 停止 mihomo
-  mh end
-
-  # 输出代理环境变量
-  mh env
-
-  # 切换模式
-  mh mode rule
-  mh mode global
-  mh mode direct
-
-  # 查看/重置基础规则
-  mh rules show
-  mh rules reset
-
-  # 一键诊断
-  mh doctor
-
-  # 查看节点列表
-  mh -l
-
-  # 按关键词筛选并测速排序后切换
+  mh select demo
   mh 美国
-
-  # TUN 开关
-  sudo mh tun on
-  sudo mh tun off
-  mh tun toggle
+  eval "\$(mh env)"
 
 Notes:
-  - API 不通时，很多功能会失败：确保 mihomo 正在运行且 external-controller 为 ${API_HOST}:${API_PORT}
-  - 如果刚启动就查询失败，wait_api 会稍等 mihomo API 就绪（避免 race）
-  - `mh` 是子进程，不能直接修改你当前 shell 的代理环境；需要 `eval "\$(mh env)"` 或写入 rc 文件
+  root=${MIHOMO_ROOT}
+  api=${API_BASE}
+  mixed-port=${MIXED_PORT}
+  mihomo=${MIHOMO_BIN}
 EOF
 }
 
@@ -691,41 +764,95 @@ current_profile() {
   cat "${MIHOMO_ROOT}/current.profile"
 }
 
-current_profile_cfg() {
-  local prof
-  prof="$(current_profile)" || return 1
-  printf '%s/%s/config.yaml\n' "$MIHOMO_ROOT" "$prof"
+ensure_bypass_list() {
+  local profile_dir="$1"
+  local file="${profile_dir}/bypass.list"
+  [[ -f "$file" ]] && return 0
+  cat > "$file" <<BYPASS
+*zhihu.com
+*zhimg.com
+*jd.com
+100ime-iat-api.xfyun.cn
+*360buyimg.com
+localhost
+*.local
+127.*
+10.*
+172.*
+192.168.*
+BYPASS
+}
+
+compile_bypass_rules() {
+  local file="$1"
+  local line value prefix
+  [[ -f "$file" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(printf "%s" "$line" | sed -E "s/^[[:space:]]+|[[:space:]]+$//g")"
+    [[ -z "$line" ]] && continue
+
+    case "$line" in
+      */*)
+        printf "%s\n" "IP-CIDR,${line},DIRECT,no-resolve"
+        ;;
+      [0-9]*.*\*)
+        prefix="${line%%.*}"
+        case "$prefix" in
+          10) printf "%s\n" "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve" ;;
+          127) printf "%s\n" "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve" ;;
+          172) printf "%s\n" "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve" ;;
+          192) printf "%s\n" "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve" ;;
+          *) warn "unsupported bypass IP wildcard: $line" ;;
+        esac
+        ;;
+      [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+        printf "%s\n" "IP-CIDR,${line}/32,DIRECT,no-resolve"
+        ;;
+      \**)
+        value="${line#\*}"
+        value="${value#.}"
+        [[ -n "$value" ]] && printf "%s\n" "DOMAIN-SUFFIX,${value},DIRECT"
+        ;;
+      .*)
+        value="${line#.}"
+        [[ -n "$value" ]] && printf "%s\n" "DOMAIN-SUFFIX,${value},DIRECT"
+        ;;
+      *)
+        printf "%s\n" "DOMAIN,${line},DIRECT"
+        ;;
+    esac
+  done < "$file" | awk "!seen[\$0]++"
+}
+
+rules_json_from_lines() {
+  jq -R -s -c "split(\"\n\") | map(select(. != \"\"))"
 }
 
 reset_basic_rules() {
   local cfg="$1"
   [[ -f "$cfg" ]] || return 1
 
-  local provider_name
-  provider_name="$(yq -r '."proxy-providers" | keys | .[0] // empty' "$cfg" 2>/dev/null)"
-  [[ -n "$provider_name" ]] || { warn "cannot detect proxy-provider name from $cfg"; return 1; }
+  local providers_json profile_dir bypass_rules rules_json
+  providers_json="$(yq -c '."proxy-providers" | keys' "$cfg" 2>/dev/null)"
+  [[ "$providers_json" != "null" && "$providers_json" != "[]" ]] || { warn "cannot detect proxy-provider names from $cfg"; return 1; }
 
-  yq -y -i "
-    .mode = \"rule\" |
-    .[\"proxy-groups\"] = [
-      {\"name\":\"Proxy\",\"type\":\"select\",\"use\":[\"${provider_name}\"]},
-      {\"name\":\"Final\",\"type\":\"select\",\"proxies\":[\"Proxy\",\"DIRECT\"]}
-    ] |
-    .rules = [
-      \"DOMAIN-SUFFIX,localhost,DIRECT\",
-      \"DOMAIN-SUFFIX,local,DIRECT\",
-      \"IP-CIDR,127.0.0.0/8,DIRECT,no-resolve\",
-      \"IP-CIDR,10.0.0.0/8,DIRECT,no-resolve\",
-      \"IP-CIDR,172.16.0.0/12,DIRECT,no-resolve\",
-      \"IP-CIDR,192.168.0.0/16,DIRECT,no-resolve\",
-      \"IP-CIDR,100.64.0.0/10,DIRECT,no-resolve\",
-      \"IP-CIDR,224.0.0.0/4,DIRECT,no-resolve\",
-      \"IP-CIDR6,::1/128,DIRECT,no-resolve\",
-      \"IP-CIDR6,fc00::/7,DIRECT,no-resolve\",
-      \"IP-CIDR6,fe80::/10,DIRECT,no-resolve\",
-      \"MATCH,Final\"
-    ]
-  " "$cfg"
+  profile_dir="$(dirname "$cfg")"
+  ensure_bypass_list "$profile_dir"
+  bypass_rules="$(compile_bypass_rules "${profile_dir}/bypass.list")"
+  rules_json="$({
+    printf "%s\n" "$bypass_rules"
+    printf "%s\n" \
+      "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve" \
+      "IP-CIDR,224.0.0.0/4,DIRECT,no-resolve" \
+      "IP-CIDR6,::1/128,DIRECT,no-resolve" \
+      "IP-CIDR6,fc00::/7,DIRECT,no-resolve" \
+      "IP-CIDR6,fe80::/10,DIRECT,no-resolve" \
+      "MATCH,Final"
+  } | rules_json_from_lines)"
+
+  yq -y -i --argjson providers "$providers_json" --argjson rules "$rules_json" ".mode = \"rule\" | .[\"proxy-groups\"] = [{\"name\":\"Proxy\",\"type\":\"select\",\"use\":\$providers},{\"name\":\"Final\",\"type\":\"select\",\"proxies\":[\"Proxy\",\"DIRECT\"]}] | .rules = \$rules" "$cfg"
 }
 
 mode_set() {
@@ -838,7 +965,7 @@ tun() {
 #=============================tun控制，上===================
 
 list_nodes() {
-  # 用法：mh -l
+  local kw="${1:-}"
   wait_api 5 || { warn "mihomo API not ready"; return 1; }
 
   local pjson group now
@@ -847,19 +974,43 @@ list_nodes() {
   group="$(get_main_group)" || { warn "cannot detect main group"; return 1; }
   now="$(jq -r --arg g "$group" '.proxies[$g].now // ""' <<<"$pjson")"
 
+  local -a nodes
+  if [[ -n "$kw" ]]; then
+    mapfile -t nodes < <(jq -r --arg g "$group" --arg kw "$kw" '
+      def lc: ascii_downcase;
+      .proxies[$g].all
+      | map(select((contains($kw)) or ((lc) | contains($kw | lc))))
+      | .[]
+    ' <<<"$pjson")
+  else
+    mapfile -t nodes < <(jq -r --arg g "$group" '.proxies[$g].all[]' <<<"$pjson")
+  fi
+
+  (( ${#nodes[@]} > 0 )) || { warn "No nodes matched: ${kw:-<all>}"; return 1; }
+
   echo "📌 Group: ${group}"
   [[ -n "$now" ]] && echo "⭐ Now:   ${now}"
+  [[ -n "$kw" ]] && echo "🔎 Filter: ${kw}"
   echo
 
-  # 列出 all 节点，排除 DIRECT/REJECT 的话可以加过滤；这里默认全列出并标记当前
-  jq -r --arg g "$group" --arg now "$now" '
-    .proxies[$g].all
-    | to_entries[]
-    | "\(.key + 1)) " + (if .value == $now then "⭐ " else "   " end) + .value
-  ' <<<"$pjson"
+  local i
+  for i in "${!nodes[@]}"; do
+    printf "  %d) %s%s\n" "$((i+1))" "$(if [[ "${nodes[$i]}" == "$now" ]]; then printf "⭐ "; else printf "   "; fi)" "${nodes[$i]}"
+  done
+
+  [[ -t 0 ]] || return 0
+  local pick
+  while true; do
+    read -r -p "👉 选择节点 (1-${#nodes[@]}, 0 cancel): " pick
+    [[ "$pick" =~ ^[0-9]+$ ]] || { echo "❌ 请输入数字"; continue; }
+    (( pick == 0 )) && { echo "cancelled"; return 0; }
+    (( pick>=1 && pick<=${#nodes[@]} )) || { echo "❌ 超出范围"; continue; }
+    break
+  done
+
+  switch_group_node "$group" "${nodes[$((pick-1))]}"
+  speedtest_now 1500 || true
 }
-
-
 
 #===============================搜索测速排序，下======================
 # 批量测延迟（默认并发 6），输出："<delay>\t<node>"
@@ -1090,7 +1241,7 @@ debug_one() {
   shift
 
   local -a debug_code=()
-  debug_code[1]="ss -lntp | grep -E ':(9090|9091|7897|7898|7890|7891)'|| echo \"❌ 未找到代理服务\""
+  debug_code[1]="ss -lntp | grep -E ':(9090|9091|7890|7891)'|| echo \"❌ 未找到代理服务\""
   debug_code[2]="ps -fp \${1:-} -o pid,ppid,cmd"
   debug_code[3]="net_test"
   debug_code[4]="net_test_double"
@@ -1099,7 +1250,7 @@ debug_one() {
   debug_code[7]="resolvectl status 2>/dev/null | sed -n '1,120p' || cat /etc/resolv.conf"
 
   local -a debug_desc=()
-  debug_desc[1]="检查 9090/9091/7897/7898 端口监听:"
+  debug_desc[1]="检查 9090/9091/7890/7891 端口监听:"
   debug_desc[2]="查看指定 PID 的进程信息:"
   debug_desc[3]="测试一下网络(仅proxy)"
   debug_desc[4]="测试一下网络(直连+proxy)"
@@ -1127,6 +1278,38 @@ debug_one() {
   return 1
 }
 
+sysproxy_cmd() {
+  local action="${1:-status}"
+  command -v gsettings >/dev/null 2>&1 || die "gsettings not found; this sysproxy command is for GNOME/Ubuntu desktops"
+
+  case "$action" in
+    on)
+      gsettings set org.gnome.system.proxy mode 'manual'
+      gsettings set org.gnome.system.proxy.http host '127.0.0.1'
+      gsettings set org.gnome.system.proxy.http port "${MIXED_PORT}"
+      gsettings set org.gnome.system.proxy.https host '127.0.0.1'
+      gsettings set org.gnome.system.proxy.https port "${MIXED_PORT}"
+      gsettings set org.gnome.system.proxy.socks host '127.0.0.1'
+      gsettings set org.gnome.system.proxy.socks port "${SOCK_PORT}"
+      gsettings set org.gnome.system.proxy ignore-hosts "['localhost','127.0.0.0/8','::1','10.0.0.0/8','172.16.0.0/12','192.168.0.0/16']"
+      info "system proxy enabled: http=127.0.0.1:${MIXED_PORT}, socks=127.0.0.1:${SOCK_PORT}"
+      ;;
+    off)
+      gsettings set org.gnome.system.proxy mode 'none'
+      info "system proxy disabled"
+      ;;
+    status)
+      echo "mode=$(gsettings get org.gnome.system.proxy mode)"
+      echo "http=$(gsettings get org.gnome.system.proxy.http host):$(gsettings get org.gnome.system.proxy.http port)"
+      echo "https=$(gsettings get org.gnome.system.proxy.https host):$(gsettings get org.gnome.system.proxy.https port)"
+      echo "socks=$(gsettings get org.gnome.system.proxy.socks host):$(gsettings get org.gnome.system.proxy.socks port)"
+      ;;
+    *)
+      die "usage: $0 sysproxy [on|off|status]"
+      ;;
+  esac
+}
+
 doctor() {
   local prof cfg
   prof="$(current_profile 2>/dev/null || true)"
@@ -1150,7 +1333,7 @@ doctor() {
   echo
 
   echo "== ports =="
-  ss -lnt 2>/dev/null | grep -E ":(9090|7897|7898|1053)\\b" || echo "no mh ports listening"
+  ss -lnt 2>/dev/null | grep -E ":(9090|7890|7891|1053)\\b" || echo "no mh ports listening"
   echo
 
   echo "== runtime =="
@@ -1179,83 +1362,6 @@ doctor() {
   fi
 }
 
-proxy_on() {
-  export http_proxy="http://127.0.0.1:${MIXED_PORT}"
-  export https_proxy="http://127.0.0.1:${MIXED_PORT}"
-  export all_proxy="socks5h://127.0.0.1:${MIXED_PORT}"
-
-  export HTTP_PROXY="$http_proxy"
-  export HTTPS_PROXY="$https_proxy"
-  export ALL_PROXY="$all_proxy"
-# 设置no，是为了避免mihomo自己访问自己
-  export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-  export no_proxy="$NO_PROXY"
-}
-
-proxy_off() {
-  unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY no_proxy
-}
-
-
-# proxy_env() {
-#   local action="${1:-}"
-#   local bashrc="${HOME}/.bashrc"
-#   local port="${2:-${MIXED_PORT:-7890}}"
-
-#   [[ -f "$bashrc" ]] || { echo "❌ not found: $bashrc"; return 1; }
-
-#   # 备份
-#   local bak="${bashrc}.bak.$(date +%Y%m%d%H%M%S)"
-#   cp -a "$bashrc" "$bak" || { echo "❌ backup failed"; return 1; }
-
-#   # 1) 先清理：标记块 + 常见代理 export 行
-#   #    - 标记块：# >>> MH PROXY BEGIN ... # <<< MH PROXY END
-#   #    - 以及零散的 export http_proxy/HTTP_PROXY/NO_PROXY...（避免残留）
-#   perl -0777 -pe '
-#     s/\n?# >>> MH PROXY BEGIN\n.*?\n# <<< MH PROXY END\n?/\n/sg;
-#   ' -i "$bashrc"
-
-#   # 删除零散的代理行（只删我们关心的这些变量）
-#   sed -i \
-#     -e '/^[[:space:]]*export[[:space:]]\+\(http_proxy\|https_proxy\|all_proxy\|HTTP_PROXY\|HTTPS_PROXY\|ALL_PROXY\|NO_PROXY\|no_proxy\)=/d' \
-#     -e '/^[[:space:]]*\(http_proxy\|https_proxy\|all_proxy\|HTTP_PROXY\|HTTPS_PROXY\|ALL_PROXY\|NO_PROXY\|no_proxy\)=/d' \
-#     "$bashrc"
-
-#   case "$action" in
-#     on)
-#       cat >>"$bashrc" <<EOF
-
-# # >>> MH PROXY BEGIN
-# export http_proxy="http://127.0.0.1:${port}"
-# export https_proxy="http://127.0.0.1:${port}"
-# export all_proxy="socks5h://127.0.0.1:${port}"
-
-# export HTTP_PROXY="\$http_proxy"
-# export HTTPS_PROXY="\$https_proxy"
-# export ALL_PROXY="\$all_proxy"
-
-# export NO_PROXY="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-# export no_proxy="\$NO_PROXY"
-# # <<< MH PROXY END
-# EOF
-#       echo "✅ proxy_env on: wrote proxy to $bashrc (port=${port})"
-#       echo "   apply with: source ~/.bashrc"
-#       ;;
-#     off)
-#       echo "✅ proxy_env off: removed proxy lines from $bashrc"
-#       echo "   apply with: source ~/.bashrc"
-#       ;;
-#     *)
-#       echo "usage:"
-#       echo "  proxy_env on [port]   # write proxy exports into ~/.bashrc (default port=\${MIXED_PORT:-7890})"
-#       echo "  proxy_env off         # remove proxy exports from ~/.bashrc"
-#       echo "backup:"
-#       echo "  $bak"
-#       return 1
-#       ;;
-#   esac
-# }
-
 #=========================debug,上===============================
 
 main() {
@@ -1283,12 +1389,18 @@ main() {
         doctor ;;
     env)
         show_proxy_exports ;;
+    theme)
+        shift; theme_cmd "${1:-show}" ;;
+    sysproxy)
+        shift; sysproxy_cmd "${1:-status}" ;;
+    update)
+        shift; update_providers_cmd "${1:-}" ;;
     mode)
         shift; mode_set "${1:-}" ;;
     rules)
         shift; rules_cmd "${1:-show}" ;;
     help|-h|--help) help ;;
-    -l|--list|list) list_nodes ;;
+    -l|--list|list) shift; list_nodes "${1:-}" ;;
     tun) shift; tun "${1:-toggle}" ;;
     *) pick_switch_with_delay "${1:-}" 1200 ;;
   esac
